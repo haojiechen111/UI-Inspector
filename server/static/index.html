@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>车载 UI 工具</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="header">
+        <div class="brand">
+            <span class="logo-icon">🚗</span>
+            <h1>Car UI Inspector</h1>
+        </div>
+        <div class="controls">
+            <div class="control-group">
+                <select id="deviceSelect" onchange="onDeviceChanged()">
+                    <option value="">正在加载设备...</option>
+                </select>
+                <button class="btn-icon" onclick="refreshDeviceList()" title="刷新设备列表">🔄</button>
+            </div>
+            <div class="control-group">
+                <select id="displaySelect" onchange="refreshSnapshot()">
+                    <option value="0">默认屏幕 (0)</option>
+                </select>
+                <button class="btn-icon" onclick="refreshDisplayList()" title="刷新屏幕列表">🔄</button>
+            </div>
+            <button class="btn-primary" onclick="connectDevice()">连接设备</button>
+            <span id="status" class="status-badge">未连接</span>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- Left Column: Screen -->
+        <div class="panel screen-panel" id="screenPanel">
+            <div class="panel-header">
+                <h2>设备屏幕</h2>
+                <div class="panel-actions">
+                    <button class="btn-icon-panel" onclick="toggleSidebar()" title="展开/收起右侧边栏">↔️</button>
+                    <div class="divider"></div>
+                    <label class="toggle-switch" title="点击屏幕时同步点击真实设备">
+                        <input type="checkbox" id="realControl">
+                        <span class="slider"></span>
+                        <span class="label-text">实时控制</span>
+                    </label>
+                    <div class="divider"></div>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="autoRefresh">
+                        <span class="slider"></span>
+                        <span class="label-text">自动刷新</span>
+                    </label>
+                    <button class="btn-secondary" onclick="refreshSnapshot()">📸 刷新</button>
+                </div>
+            </div>
+            <div id="screen-container">
+                <canvas id="deviceScreen"></canvas>
+            </div>
+        </div>
+
+        <!-- Main Horizontal Splitter -->
+        <div id="mainSplitter" title="横向拖动调整屏幕宽度"></div>
+
+        <!-- Right Column: Sidebar -->
+        <div class="sidebar" id="sidebar">
+            <!-- Properties (Now Top, Larger) -->
+            <div class="panel props-panel" id="propsPanel">
+                <div class="panel-header">
+                    <h2>属性详情</h2>
+                </div>
+                <div id="props-container">
+                    <div class="empty-state">请点击元素查看属性</div>
+                    <table id="props-table"></table>
+                </div>
+            </div>
+
+            <!-- Resizable Splitter -->
+            <div id="sidebarSplitter" title="拖动调整大小"></div>
+
+            <!-- UI Tree (Now Bottom) -->
+            <div class="panel tree-panel" id="treePanel">
+                <div class="panel-header">
+                    <h2>UI 层级结构</h2>
+                </div>
+                <div id="tree-container" class="tree-view">
+                    <div class="empty-state">暂无层级数据</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Overlay for loading -->
+    <div id="loading" class="hidden">
+        <div class="spinner"></div>
+        <p>加载中...</p>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
