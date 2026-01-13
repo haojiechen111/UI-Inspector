@@ -128,17 +128,24 @@ function refreshScreen() {
         const displayId = displaySelect.value || 0;
         const img = new Image();
         img.src = `/api/screenshot?display=${displayId}&t=${new Date().getTime()}`;
-        img.onload = () => {
-            screenImage = img;
-            // 2x 采样：内部分辨率翻倍，文字更清晰
-            const scale = 2;
-            canvas.width = screenImage.naturalWidth * scale;
-            canvas.height = screenImage.naturalHeight * scale;
-            // 保持 CSS 显示大小不变，提升内部像素密度
-            ctx.imageSmoothingEnabled = true;
-            ctx.imageSmoothingQuality = 'high';
-            drawScreen();
-            resolve();
+        img.onload = async () => {
+            try {
+                // 开启异步解码，避免主线程卡顿，实现 scrcpy 般的流畅感
+                if (img.decode) await img.decode();
+                screenImage = img;
+
+                const hqScale = 2;
+                canvas.width = screenImage.naturalWidth * hqScale;
+                canvas.height = screenImage.naturalHeight * hqScale;
+
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                drawScreen();
+                resolve();
+            } catch (err) {
+                console.warn("Decode failed", err);
+                resolve();
+            }
         };
         img.onerror = () => {
             console.warn("无法获取截图");
@@ -157,18 +164,25 @@ function toggleSidebar() {
 function drawScreen() {
     if (!screenImage.src) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    // 渲染时填满整个高密度 Canvas
+
+    // 渲染截图 (填满整个 2x Canvas)
     ctx.drawImage(screenImage, 0, 0, canvas.width, canvas.height);
+
+    // 绘制 UI 高亮 (需要缩放到 2x 坐标空间)
+    ctx.save();
+    ctx.scale(2, 2);
 
     // Draw Hover
     if (hoverNode && hoverNode !== selectedNode) {
-        drawHighlight(hoverNode, '#3b82f6', 'rgba(59, 130, 246, 0.1)'); // Blue
+        drawHighlight(hoverNode, '#3b82f6', 'rgba(59, 130, 246, 0.1)');
     }
 
     // Draw Selected
     if (selectedNode) {
-        drawHighlight(selectedNode, '#ef4444', 'rgba(239, 68, 68, 0.2)'); // Red
+        drawHighlight(selectedNode, '#ef4444', 'rgba(239, 68, 68, 0.2)');
     }
+
+    ctx.restore();
 }
 
 async function refreshHierarchy() {
@@ -442,8 +456,10 @@ let dragStartTime = 0;
 
 function getCanvasCoords(e) {
     const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+
+    // 关键修正：点击坐标必须映射回物理设备的原始分辨率 (1x)，而不是 Canvas 的 2x 采样分辨率
+    const scaleX = screenImage.naturalWidth / rect.width;
+    const scaleY = screenImage.naturalHeight / rect.height;
 
     return {
         x: (e.clientX - rect.left) * scaleX,
@@ -552,7 +568,8 @@ async function performRealSwipe(sx, sy, ex, ey, duration) {
                 display: parseInt(displaySelect.value || 0)
             })
         });
-        setTimeout(refreshScreen, 800); // Trigger refresh after swipe
+        // Fast refresh after interaction
+        setTimeout(refreshScreen, 100);
     } catch (e) {
         console.error("Swipe Failed", e);
     }
@@ -574,7 +591,7 @@ async function performRealClick(x, y) {
         if (document.getElementById('autoRefresh').checked) {
             // Screen will auto refresh soon
         } else {
-            setTimeout(refreshScreen, 500); // Trigger a refresh after click
+            setTimeout(refreshScreen, 100); // Trigger a refresh after click
         }
     } catch (e) {
         console.error("Click Failed", e);
@@ -592,7 +609,7 @@ async function performRealBack() {
             })
         });
         // Fast refresh after back
-        setTimeout(refreshScreen, 300);
+        setTimeout(refreshScreen, 100);
     } catch (e) {
         console.error("Back Failed", e);
     }
@@ -655,8 +672,10 @@ async function autoRefreshTick() {
             isAutoRefreshing = false;
         }
     }
-    // High performance loop: 300ms is a good balance for ADB
-    setTimeout(autoRefreshTick, 300);
+    // "Turbo Mode": No fixed delay. If checked, request next frame immediately.
+    // This allows the FPS to be limited only by the ADB/Network speed.
+    const delay = (cb && cb.checked) ? 0 : 500;
+    setTimeout(autoRefreshTick, delay);
 }
 
 // Start the loop

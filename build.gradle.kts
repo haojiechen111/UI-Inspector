@@ -1,6 +1,6 @@
 plugins {
     id("java")
-    id("org.jetbrains.intellij") version "1.18.0"
+    id("org.jetbrains.intellij") version "1.17.3"
     kotlin("jvm") version "1.9.10"
 }
 
@@ -31,5 +31,16 @@ tasks {
     }
     withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
         kotlinOptions.jvmTarget = "17"
+    }
+
+    buildSearchableOptions {
+        enabled = false // Speed up build
+    }
+
+    prepareSandbox {
+        // 将插件目录下的 server 文件夹拷贝到安装包中
+        from("server") {
+            into("${intellij.pluginName.get()}/server")
+        }
     }
 }

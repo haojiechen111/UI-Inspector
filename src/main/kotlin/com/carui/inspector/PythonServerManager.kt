@@ -25,17 +25,27 @@ object PythonServerManager {
             return
         }
 
-        LOG.info("Starting Car UI Server from ${serverDir.absolutePath}")
+        val logFile = File(serverDir, "server_log.txt")
+        LOG.info("Starting Car UI Server. Logs at: ${logFile.absolutePath}")
 
         val pb = ProcessBuilder("python3", "main.py")
         pb.directory(serverDir)
         pb.redirectErrorStream(true)
+        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
         
         try {
             process = pb.start()
-            // Optional: Start a thread to read logs if needed
         } catch (e: Exception) {
-            LOG.error("Failed to start Python server: ${e.message}")
+            LOG.error("Failed to start with 'python3', trying 'python': ${e.message}")
+            try {
+               val pb2 = ProcessBuilder("python", "main.py")
+               pb2.directory(serverDir)
+               pb2.redirectErrorStream(true)
+               pb2.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+               process = pb2.start()
+            } catch (e2: Exception) {
+               LOG.error("Both python3 and python failed: ${e2.message}")
+            }
         }
     }
 
