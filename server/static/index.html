@@ -17,15 +17,17 @@
         </div>
         <div class="controls">
             <div class="control-group">
-                <select id="deviceSelect" onchange="onDeviceChanged()">
-                    <option value="">正在加载设备...</option>
-                </select>
-                <button class="btn-icon" onclick="refreshDeviceList()" title="刷新设备列表">🔄</button>
+                <button class="btn-select" id="deviceSelectBtn" onclick="showDeviceModal()">
+                    <span id="deviceSelectText">正在加载设备...</span>
+                    <span class="dropdown-arrow">▼</span>
+                </button>
+                <button class="btn-icon" onclick="refreshDeviceList(true)" title="刷新并自动连接设备">🔄</button>
             </div>
             <div class="control-group">
-                <select id="displaySelect" onchange="refreshSnapshot()">
-                    <option value="0">默认屏幕 (0)</option>
-                </select>
+                <button class="btn-select" id="displaySelectBtn" onclick="showDisplayModal()">
+                    <span id="displaySelectText">默认屏幕 (0)</span>
+                    <span class="dropdown-arrow">▼</span>
+                </button>
                 <button class="btn-icon" onclick="refreshDisplayList()" title="刷新屏幕列表">🔄</button>
             </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
@@ -94,7 +96,42 @@
     <!-- Overlay for loading -->
     <div id="loading" class="hidden">
         <div class="spinner"></div>
-        <p>加载中...</p>
+        <p id="loadingText">加载中...</p>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="connectionToast">
+        <div class="toast-header">
+            <h3>🔗 设备连接日志</h3>
+            <button class="toast-close" onclick="closeToast()">×</button>
+        </div>
+        <div class="toast-body" id="toastLog"></div>
+    </div>
+
+    <!-- Device Selection Modal -->
+    <div id="deviceModal" class="modal" onclick="closeDeviceModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📱 选择设备</h3>
+                <button class="modal-close" onclick="closeDeviceModal()">×</button>
+            </div>
+            <div class="modal-body" id="deviceModalList">
+                <div class="empty-state">正在加载设备...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Display Selection Modal -->
+    <div id="displayModal" class="modal" onclick="closeDisplayModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>🖥️ 选择显示屏幕</h3>
+                <button class="modal-close" onclick="closeDisplayModal()">×</button>
+            </div>
+            <div class="modal-body" id="displayModalList">
+                <div class="empty-state">正在加载屏幕...</div>
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>

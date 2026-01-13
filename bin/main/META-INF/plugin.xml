@@ -1,0 +1,21 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>com.carui.inspector</id>
+    <name>Car UI Inspector</name>
+    <vendor email="support@carui.com" url="https://www.carui.com">CarUI Team</vendor>
+
+    <description><![CDATA[
+    Real-time visual debugging tool for Android Car UIs.
+    Supports multiple displays and real-time interaction.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Car UI Inspector" 
+                    secondary="true" 
+                    icon="AllIcons.Actions.Preview" 
+                    anchor="right" 
+                    factoryClass="com.carui.inspector.CarUiToolWindowFactory"/>
+    </extensions>
+</idea-plugin>

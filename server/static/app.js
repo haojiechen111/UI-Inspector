@@ -3,8 +3,12 @@ const ctx = canvas.getContext('2d');
 const treeContainer = document.getElementById('tree-container');
 const propsContainer = document.getElementById('props-container');
 const loading = document.getElementById('loading');
-const deviceSelect = document.getElementById('deviceSelect');
-const displaySelect = document.getElementById('displaySelect');
+
+// 存储设备和显示信息
+let devicesList = [];
+let displaysList = [];
+let currentDevice = null;
+let currentDisplay = "0";
 
 let rootNode = null;
 let selectedNode = null;
@@ -12,101 +16,393 @@ let hoverNode = null; // New for hover
 let screenImage = new Image();
 let mapNodeToDom = new Map();
 
+// Modal functions
+function showDeviceModal() {
+    const modal = document.getElementById('deviceModal');
+    modal.classList.add('show');
+    updateDeviceModalList();
+}
+
+function closeDeviceModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = document.getElementById('deviceModal');
+    modal.classList.remove('show');
+}
+
+function showDisplayModal() {
+    const modal = document.getElementById('displayModal');
+    modal.classList.add('show');
+    updateDisplayModalList();
+}
+
+function closeDisplayModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = document.getElementById('displayModal');
+    modal.classList.remove('show');
+}
+
+function updateDeviceModalList() {
+    const listContainer = document.getElementById('deviceModalList');
+    if (devicesList.length === 0) {
+        listContainer.innerHTML = '<div class="empty-state">未发现设备</div>';
+        return;
+    }
+    
+    listContainer.innerHTML = '';
+    devicesList.forEach(d => {
+        const item = document.createElement('div');
+        item.className = 'modal-item';
+        if (currentDevice && currentDevice.serial === d.serial) {
+            item.classList.add('selected');
+        }
+        
+        const icon = document.createElement('span');
+        icon.className = 'modal-item-icon';
+        icon.innerText = '📱';
+        item.appendChild(icon);
+        
+        const text = document.createElement('div');
+        text.className = 'modal-item-text';
+        const ssLabel = d.ss_type ? ` [${d.ss_type}]` : '';
+        text.innerHTML = `<strong>${d.model}</strong><br><small style="color: #6b7280">${d.serial}${ssLabel}</small>`;
+        item.appendChild(text);
+        
+        if (d.ss_type) {
+            const badge = document.createElement('span');
+            badge.className = 'modal-item-badge';
+            badge.innerText = d.ss_type;
+            item.appendChild(badge);
+        }
+        
+        item.onclick = () => {
+            selectDevice(d);
+            closeDeviceModal();
+        };
+        
+        listContainer.appendChild(item);
+    });
+}
+
+function updateDisplayModalList() {
+    const listContainer = document.getElementById('displayModalList');
+    if (displaysList.length === 0) {
+        listContainer.innerHTML = '<div class="empty-state">未发现显示屏幕</div>';
+        return;
+    }
+    
+    listContainer.innerHTML = '';
+    displaysList.forEach(d => {
+        const item = document.createElement('div');
+        item.className = 'modal-item';
+        if (currentDisplay === d.id) {
+            item.classList.add('selected');
+        }
+        
+        const icon = document.createElement('span');
+        icon.className = 'modal-item-icon';
+        icon.innerText = '🖥️';
+        item.appendChild(icon);
+        
+        const text = document.createElement('div');
+        text.className = 'modal-item-text';
+        text.innerText = d.description;
+        item.appendChild(text);
+        
+        item.onclick = () => {
+            selectDisplay(d.id, d.description);
+            closeDisplayModal();
+        };
+        
+        listContainer.appendChild(item);
+    });
+}
+
+function selectDevice(device) {
+    currentDevice = device;
+    const btn = document.getElementById('deviceSelectText');
+    const ssLabel = device.ss_type ? ` [${device.ss_type}]` : '';
+    btn.innerText = `${device.model} (${device.serial})${ssLabel}`;
+    onDeviceChanged();
+}
+
+function selectDisplay(displayId, description) {
+    currentDisplay = displayId;
+    const btn = document.getElementById('displaySelectText');
+    btn.innerText = description;
+    refreshSnapshot();
+}
+
 // Init
 window.onload = () => {
     refreshDeviceList();
 };
 
-async function refreshDeviceList() {
-    deviceSelect.innerHTML = '<option value="">正在获取设备...</option>';
+// Track if we've already auto-connected to avoid repeated connections
+let hasAutoConnected = false;
+
+// Toast notification helpers
+let toastTimeout = null;
+
+function showToast() {
+    const toast = document.getElementById('connectionToast');
+    toast.classList.add('show');
+    
+    // Clear existing timeout
+    if (toastTimeout) {
+        clearTimeout(toastTimeout);
+    }
+    
+    // Auto close after 5 seconds
+    toastTimeout = setTimeout(() => {
+        closeToast();
+    }, 5000);
+}
+
+function closeToast() {
+    const toast = document.getElementById('connectionToast');
+    toast.classList.remove('show');
+    if (toastTimeout) {
+        clearTimeout(toastTimeout);
+        toastTimeout = null;
+    }
+}
+
+function addLogEntry(message, type = 'info') {
+    const logContainer = document.getElementById('toastLog');
+    const timestamp = new Date().toLocaleTimeString();
+    const colors = {
+        'info': '#3b82f6',
+        'success': '#10b981',
+        'warning': '#f59e0b',
+        'error': '#ef4444'
+    };
+    const color = colors[type] || colors['info'];
+    
+    const entry = document.createElement('div');
+    entry.style.marginBottom = '8px';
+    entry.style.paddingLeft = '10px';
+    entry.style.borderLeft = `3px solid ${color}`;
+    entry.innerHTML = `<span style="color: #6b7280; font-size: 11px;">${timestamp}</span><br><span style="color: ${color}; font-weight: 500;">${message}</span>`;
+    
+    logContainer.appendChild(entry);
+    logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+function clearLog() {
+    const logContainer = document.getElementById('toastLog');
+    logContainer.innerHTML = '';
+}
+
+async function refreshDeviceList(autoConnect = false) {
+    console.log("[RefreshDeviceList] 开始获取设备列表... autoConnect:", autoConnect);
+    const btn = document.getElementById('deviceSelectText');
+    btn.innerText = '正在获取设备...';
+    
     try {
         const res = await fetch('/api/devices');
-        const devices = await res.json();
+        devicesList = await res.json();
+        console.log("[RefreshDeviceList] 获取到设备:", devicesList);
 
-        deviceSelect.innerHTML = '';
-        if (devices.length === 0) {
-            const opt = document.createElement('option');
-            opt.text = "未发现设备";
-            deviceSelect.add(opt);
+        if (devicesList.length === 0) {
+            console.log("[RefreshDeviceList] 没有发现设备");
+            btn.innerText = '未发现设备';
             return;
         }
 
-        devices.forEach(d => {
-            const opt = document.createElement('option');
-            opt.value = d.serial;
-            opt.text = `${d.model} (${d.serial})`;
-            deviceSelect.add(opt);
-        });
-
-        // Auto refresh display list for the first device
-        if (devices.length > 0) {
-            if (!deviceSelect.value) deviceSelect.selectedIndex = 0;
-            onDeviceChanged();
+        // Select first device by default
+        if (devicesList.length > 0 && !currentDevice) {
+            currentDevice = devicesList[0];
+            selectDevice(currentDevice);
+        }
+        
+        // Auto-connect if requested
+        if (autoConnect || !hasAutoConnected) {
+            const firstDevice = devicesList[0];
+            hasAutoConnected = true;
+            console.log(`[AutoConnect] 自动连接到: ${firstDevice.serial}`);
+            
+            clearLog();
+            showToast();
+            
+            const statusEl = document.getElementById('status');
+            statusEl.innerText = '正在连接...';
+            statusEl.style.color = '#f59e0b';
+            
+            addLogEntry(`🔍 检测到设备: ${firstDevice.model}`, 'info');
+            addLogEntry(`📱 Serial: ${firstDevice.serial}`, 'info');
+            if (firstDevice.ss_type) {
+                addLogEntry(`⚙️ 设备类型: ${firstDevice.ss_type} (需要初始化)`, 'warning');
+            } else {
+                addLogEntry(`✅ 普通Android设备`, 'info');
+            }
+            
+            currentDevice = firstDevice;
+            selectDevice(firstDevice);
+            setTimeout(() => connectDevice(), 500);
         }
     } catch (e) {
-        console.error(e);
-        deviceSelect.innerHTML = '<option value="">获取设备失败</option>';
+        console.error("[RefreshDeviceList] 错误:", e);
+        const statusEl = document.getElementById('status');
+        statusEl.innerText = `获取设备失败: ${e.message}`;
+        statusEl.style.color = '#ef4444';
+        btn.innerText = '获取设备失败';
+        
+        clearLog();
+        showToast();
+        addLogEntry(`❌ 获取设备失败: ${e.message}`, 'error');
     }
 }
 
 async function onDeviceChanged() {
-    const serial = deviceSelect.value;
-    console.log("Device changed to:", serial);
-    if (!serial) return;
+    if (!currentDevice) return;
+    console.log("Device changed to:", currentDevice.serial);
     refreshDisplayList();
 }
 
 async function refreshDisplayList() {
-    displaySelect.innerHTML = '<option value="0">正在获取屏幕...</option>';
+    const btn = document.getElementById('displaySelectText');
+    btn.innerText = '正在获取屏幕...';
+    
     try {
-        console.log("Fetching displays for:", deviceSelect.value);
-        const res = await fetch(`/api/displays?serial=${deviceSelect.value}`);
-        const displays = await res.json();
-        console.log("Displays received:", displays);
-        displaySelect.innerHTML = '';
-        displays.forEach(d => {
-            const opt = document.createElement('option');
-            opt.value = d.id;
-            opt.text = d.description;
-            displaySelect.add(opt);
-        });
+        if (!currentDevice) return;
+        console.log("Fetching displays for:", currentDevice.serial);
+        const res = await fetch(`/api/displays?serial=${currentDevice.serial}`);
+        displaysList = await res.json();
+        console.log("Displays received:", displaysList);
+        
+        if (displaysList.length > 0) {
+            currentDisplay = displaysList[0].id;
+            selectDisplay(displaysList[0].id, displaysList[0].description);
+        }
     } catch (e) {
         console.error("Failed to get displays", e);
-        displaySelect.innerHTML = '<option value="0">默认屏幕 (0)</option>';
+        btn.innerText = '默认屏幕 (0)';
+        displaysList = [{ id: "0", description: "默认屏幕 (0)" }];
     }
 }
 
 async function connectDevice() {
-    const serial = deviceSelect.value;
-    if (!serial || serial === "未发现设备") {
+    if (!currentDevice) {
+        console.error("[ConnectDevice] 没有选择有效设备");
         alert("请先选择一个有效的设备！");
         return;
     }
+    
+    const serial = currentDevice.serial;
+    const needsInit = currentDevice.needs_init || false;
+    const ssType = currentDevice.ss_type || 'SS';
+    
+    console.log(`[ConnectDevice] 开始连接设备: ${serial}`);
+    console.log(`[ConnectDevice] 设备信息 - Serial: ${serial}, SS类型: ${ssType}, 需要初始化: ${needsInit}`);
+    addLogEntry(`🚀 开始连接设备: ${serial}`, 'info');
 
     loading.classList.remove('hidden');
+    
     try {
-        // Also refresh display list on connect just in case
+        let targetSerial = serial;
+        
+        // Step 1: Auto initialize SS device if needed
+        if (needsInit) {
+            console.log(`[ConnectDevice] 检测到${ssType}设备，开始初始化...`);
+            addLogEntry(`⚙️ 检测到${ssType}设备，需要执行初始化命令`, 'warning');
+            
+            const statusEl = document.getElementById('status');
+            statusEl.innerText = `正在初始化${ssType}设备...`;
+            statusEl.style.color = '#f59e0b';
+            
+            addLogEntry(`📝 步骤1: 执行 adb root`, 'info');
+            addLogEntry(`📝 步骤2: 执行 adb shell adbconnect.sh`, 'info');
+            addLogEntry(`📝 步骤3: 执行 adb forward tcp:5559 tcp:5557`, 'info');
+            addLogEntry(`📝 步骤4: 执行 adb connect localhost:5559`, 'info');
+            addLogEntry(`📝 步骤5: 执行 adb -s localhost:5559 root`, 'info');
+            
+            console.log(`[ConnectDevice] 调用 /api/init-ss4 API`);
+            const initRes = await fetch('/api/init-ss4', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ serial: serial })
+            });
+            
+            console.log(`[ConnectDevice] 初始化API响应状态: ${initRes.status}`);
+            
+            if (!initRes.ok) {
+                const errorText = await initRes.text();
+                console.error(`[ConnectDevice] 初始化失败: ${errorText}`);
+                addLogEntry(`❌ ${ssType}初始化失败: ${errorText}`, 'error');
+                throw new Error(`${ssType}初始化失败: ${errorText}`);
+            }
+            
+            const initData = await initRes.json();
+            console.log(`[ConnectDevice] ${ssType}初始化成功:`, initData);
+            targetSerial = initData.new_serial; // Use localhost:5559
+            console.log(`[ConnectDevice] 新的serial: ${targetSerial}`);
+            
+            addLogEntry(`✅ ${ssType}初始化成功！`, 'success');
+            addLogEntry(`🔄 新设备地址: ${targetSerial}`, 'success');
+            
+            statusEl.innerText = `${ssType}初始化完成，正在连接...`;
+            
+            // Wait a bit for the connection to stabilize
+            console.log("[ConnectDevice] 等待连接稳定...");
+            addLogEntry(`⏳ 等待连接稳定...`, 'info');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Refresh device list to include localhost:5559
+            console.log("[ConnectDevice] 刷新设备列表...");
+            await refreshDeviceList();
+            
+            console.log(`[ConnectDevice] 已切换到新serial: ${targetSerial}`);
+        } else {
+            console.log("[ConnectDevice] 普通设备，无需初始化");
+            addLogEntry(`✅ 普通Android设备，直接连接`, 'info');
+        }
+        
+        // Step 2: Refresh display list
+        console.log("[ConnectDevice] 刷新显示列表...");
+        addLogEntry(`🖥️ 检测显示屏幕...`, 'info');
         await refreshDisplayList();
 
+        // Step 3: Connect to the device
+        console.log(`[ConnectDevice] 连接到设备: ${targetSerial}`);
+        addLogEntry(`🔌 正在建立连接...`, 'info');
+        
         const res = await fetch('/api/connect', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ serial: serial })
+            body: JSON.stringify({ serial: targetSerial })
         });
-        if (!res.ok) throw new Error(await res.text());
+        console.log(`[ConnectDevice] 连接API响应状态: ${res.status}`);
+        
+        if (!res.ok) {
+            const errorText = await res.text();
+            console.error(`[ConnectDevice] 连接失败: ${errorText}`);
+            addLogEntry(`❌ 连接失败: ${errorText}`, 'error');
+            throw new Error(errorText);
+        }
+        
         const data = await res.json();
+        console.log("[ConnectDevice] 连接成功，设备信息:", data);
         const productName = data.info.productName || "Unknown Device";
         const statusEl = document.getElementById('status');
         statusEl.innerText = `已连接: ${productName}`;
         statusEl.classList.remove('status-badge');
         statusEl.style.color = '#10b981';
         statusEl.style.fontWeight = 'bold';
+        
+        addLogEntry(`✅ 连接成功: ${productName}`, 'success');
+        
+        console.log("[ConnectDevice] 开始刷新快照...");
+        addLogEntry(`📸 正在获取屏幕截图...`, 'info');
         refreshSnapshot();
+        
+        addLogEntry(`🎉 全部完成！设备已就绪`, 'success');
 
     } catch (e) {
+        console.error("[ConnectDevice] 连接过程出错:", e);
         const statusEl = document.getElementById('status');
         statusEl.innerText = `错误: ${e.message}`;
         statusEl.style.color = '#ef4444';
+        addLogEntry(`❌ 连接失败: ${e.message}`, 'error');
         alert("连接失败: " + e.message);
     } finally {
         loading.classList.add('hidden');
@@ -125,7 +421,7 @@ async function refreshSnapshot(forceShowLoading = true) {
 
 function refreshScreen() {
     return new Promise((resolve) => {
-        const displayId = displaySelect.value || 0;
+        const displayId = currentDisplay || "0";
         const img = new Image();
         img.src = `/api/screenshot?display=${displayId}&t=${new Date().getTime()}`;
         img.onload = async () => {
@@ -187,7 +483,7 @@ function drawScreen() {
 
 async function refreshHierarchy() {
     try {
-        const displayId = displaySelect.value || 0;
+        const displayId = currentDisplay || "0";
         const res = await fetch(`/api/hierarchy?display=${displayId}`);
         if (!res.ok) return;
         const data = await res.json();
@@ -565,7 +861,7 @@ async function performRealSwipe(sx, sy, ex, ey, duration) {
                 end_x: Math.round(ex),
                 end_y: Math.round(ey),
                 duration: duration,
-                display: parseInt(displaySelect.value || 0)
+                display: parseInt(currentDisplay || 0)
             })
         });
         // Fast refresh after interaction
@@ -584,7 +880,7 @@ async function performRealClick(x, y) {
             body: JSON.stringify({
                 x: Math.round(x),
                 y: Math.round(y),
-                display: parseInt(displaySelect.value || 0)
+                display: parseInt(currentDisplay || 0)
             })
         });
         // Optional: Trigger refresh after a delay?
@@ -605,7 +901,7 @@ async function performRealBack() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                display: parseInt(displaySelect.value || 0)
+                display: parseInt(currentDisplay || 0)
             })
         });
         // Fast refresh after back

@@ -65,17 +65,235 @@ body {
     padding: 2px;
 }
 
-select {
-    background: transparent;
-    border: none;
+/* 自定义选择按钮 - 替代select */
+.btn-select {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background-color: #374151;
     color: white;
-    padding: 5px 10px;
-    outline: none;
+    border: 1px solid #4b5563;
+    border-radius: 4px;
+    padding: 8px 12px;
     font-size: 0.9rem;
+    cursor: pointer;
+    min-width: 200px;
+    font-family: inherit;
+    height: 36px;
+    box-sizing: border-box;
+    transition: all 0.2s;
 }
 
-select option {
-    background: var(--header-bg);
+.btn-select:hover {
+    border-color: #6b7280;
+    background-color: #4b5563;
+}
+
+.btn-select:active {
+    background-color: #4b5563;
+    transform: scale(0.98);
+}
+
+.dropdown-arrow {
+    margin-left: 8px;
+    font-size: 10px;
+    opacity: 0.7;
+}
+
+/* Modal */
+.modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 1000;
+    justify-content: center;
+    align-items: center;
+}
+
+.modal.show {
+    display: flex;
+}
+
+.modal-content {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    min-width: 400px;
+    max-width: 600px;
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    animation: modalSlideIn 0.2s ease-out;
+}
+
+@keyframes modalSlideIn {
+    from {
+        transform: translateY(-50px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.modal-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 24px;
+    cursor: pointer;
+    color: #6b7280;
+    padding: 0;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.modal-close:hover {
+    background: #f3f4f6;
+    color: var(--text-main);
+}
+
+.modal-body {
+    padding: 12px 0;
+    overflow-y: auto;
+    max-height: 400px;
+}
+
+.modal-item {
+    padding: 12px 20px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border-left: 3px solid transparent;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.modal-item:hover {
+    background-color: #f3f4f6;
+}
+
+.modal-item.selected {
+    background-color: #eff6ff;
+    border-left-color: var(--primary-color);
+    font-weight: 500;
+}
+
+.modal-item-icon {
+    font-size: 18px;
+}
+
+.modal-item-text {
+    flex: 1;
+}
+
+.modal-item-badge {
+    background: var(--primary-color);
+    color: white;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* Toast Notification for connection log */
+#connectionToast {
+    position: fixed;
+    top: 80px;
+    right: 20px;
+    z-index: 1000;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    min-width: 400px;
+    max-width: 500px;
+    max-height: 400px;
+    display: none;
+}
+
+#connectionToast.show {
+    display: block;
+    animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+.toast-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 15px;
+    border-bottom: 1px solid var(--border-color);
+    background: #f8fafc;
+    border-radius: 8px 8px 0 0;
+}
+
+.toast-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.toast-close {
+    background: none;
+    border: none;
+    font-size: 20px;
+    cursor: pointer;
+    color: #6b7280;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+}
+
+.toast-close:hover {
+    background: #e5e7eb;
+    color: var(--text-main);
+}
+
+.toast-body {
+    padding: 15px;
+    max-height: 350px;
+    overflow-y: auto;
+    font-size: 13px;
+    line-height: 1.6;
 }
 
 .btn-icon {

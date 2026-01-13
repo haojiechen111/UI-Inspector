@@ -139,12 +139,67 @@ def refresh_display_mapping(serial: str):
         print(f"Error refreshing display mapping: {e}")
         return None
 
+def detect_ss_device(serial: str) -> Optional[str]:
+    """Detect if device is SS series (SS4, SS3, etc.) by checking display.id property"""
+    try:
+        # Use getprop directly to get ro.build.display.id
+        result = subprocess.run(
+            ["adb", "-s", serial, "shell", "getprop", "ro.build.display.id"],
+            capture_output=True, text=True, timeout=5
+        )
+        
+        if result.returncode != 0:
+            print(f"[SS_DETECT] ❌ Failed to get display.id for {serial}: {result.stderr}")
+            return None
+            
+        output = result.stdout.strip()
+        print(f"[SS_DETECT] 📱 Device: {serial}")
+        print(f"[SS_DETECT] 📋 Display ID: '{output}'")
+        print(f"[SS_DETECT] 🔍 Raw repr: {repr(output)}")
+        
+        # Convert to uppercase for easier matching
+        output_upper = output.upper()
+        print(f"[SS_DETECT] 🔠 Uppercase: '{output_upper}'")
+        
+        # Direct string search - most reliable method
+        if 'SS4' in output_upper:
+            print(f"[SS_DETECT] ✅✅✅ Detected SS4 device (string match): {serial}")
+            return "SS4"
+        elif 'SS3' in output_upper:
+            print(f"[SS_DETECT] ✅✅✅ Detected SS3 device (string match): {serial}")
+            return "SS3"
+        elif 'SS2' in output_upper:
+            print(f"[SS_DETECT] ✅✅✅ Detected SS2 device (string match): {serial}")
+            return "SS2"
+        elif 'SS5' in output_upper:
+            print(f"[SS_DETECT] ✅✅✅ Detected SS5 device (string match): {serial}")
+            return "SS5"
+        else:
+            print(f"[SS_DETECT] ❌ No SS device pattern found")
+            print(f"[SS_DETECT] 💡 If this should be an SS device, check the display.id format")
+        
+        return None
+    except Exception as e:
+        print(f"[SS_DETECT] ⚠️ Exception occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 @app.get("/api/devices")
 def get_devices():
     try:
         devices = []
         for d in adb.device_list():
-             devices.append({"serial": d.serial, "model": d.prop.get("ro.product.model", "Unknown")})
+            model = d.prop.get("ro.product.model", "Unknown")
+            ss_type = detect_ss_device(d.serial)
+            
+            device_info = {
+                "serial": d.serial,
+                "model": model,
+                "ss_type": ss_type,  # Will be "SS4", "SS3", etc. or None
+                "needs_init": ss_type is not None  # True if any SS device
+            }
+            devices.append(device_info)
         return devices
     except Exception as e:
         print(f"Error listing devices: {e}")
@@ -152,6 +207,73 @@ def get_devices():
 
 class ConnectRequest(BaseModel):
     serial: Optional[str] = None
+    init_ss4: bool = False
+
+class SS4InitRequest(BaseModel):
+    serial: str
+
+@app.post("/api/init-ss4")
+def init_ss4_device(req: SS4InitRequest):
+    """Initialize SS4 device with required ADB commands"""
+    try:
+        serial = req.serial
+        print(f"Initializing SS4 device: {serial}")
+        
+        # Step 1: adb root
+        result = subprocess.run(["adb", "-s", serial, "root"], 
+                              capture_output=True, text=True, timeout=10)
+        print(f"adb root: {result.stdout}")
+        if result.returncode != 0:
+            print(f"Warning: adb root failed: {result.stderr}")
+        
+        # Wait a bit for root to take effect
+        import time
+        time.sleep(1)
+        
+        # Step 2: adb shell adbconnect.sh
+        result = subprocess.run(["adb", "-s", serial, "shell", "adbconnect.sh"], 
+                              capture_output=True, text=True, timeout=10)
+        print(f"adbconnect.sh: {result.stdout}")
+        if result.returncode != 0:
+            print(f"Warning: adbconnect.sh failed: {result.stderr}")
+        
+        time.sleep(1)
+        
+        # Step 3: adb forward tcp:5559 tcp:5557
+        result = subprocess.run(["adb", "-s", serial, "forward", "tcp:5559", "tcp:5557"], 
+                              capture_output=True, text=True, timeout=10)
+        print(f"adb forward: {result.stdout}")
+        if result.returncode != 0:
+            raise Exception(f"adb forward failed: {result.stderr}")
+        
+        time.sleep(1)
+        
+        # Step 4: adb connect localhost:5559
+        result = subprocess.run(["adb", "connect", "localhost:5559"], 
+                              capture_output=True, text=True, timeout=10)
+        print(f"adb connect: {result.stdout}")
+        if result.returncode != 0:
+            print(f"Warning: adb connect failed: {result.stderr}")
+        
+        time.sleep(2)
+        
+        # Step 5: adb -s localhost:5559 root
+        result = subprocess.run(["adb", "-s", "localhost:5559", "root"], 
+                              capture_output=True, text=True, timeout=10)
+        print(f"adb root (localhost): {result.stdout}")
+        if result.returncode != 0:
+            print(f"Warning: final root failed: {result.stderr}")
+        
+        time.sleep(1)
+        
+        return {
+            "status": "success",
+            "message": "SS4 device initialized successfully",
+            "new_serial": "localhost:5559"
+        }
+    except Exception as e:
+        print(f"SS4 initialization error: {e}")
+        raise HTTPException(status_code=500, detail=f"SS4 initialization failed: {str(e)}")
 
 @app.get("/api/displays")
 def get_displays(serial: Optional[str] = None):
@@ -388,4 +510,3 @@ def read_root():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
