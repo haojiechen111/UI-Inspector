@@ -47,7 +47,8 @@ class CarUiToolWindowFactory : ToolWindowFactory {
             while (attempts < 20) {
                 if (PythonServerManager.isServerRunning()) {
                     javax.swing.SwingUtilities.invokeLater {
-                        browser.loadURL("http://127.0.0.1:8000/static/index.html")
+                        val serverURL = PythonServerManager.getServerURL()
+                        browser.loadURL("$serverURL/static/index.html")
                     }
                     break
                 }

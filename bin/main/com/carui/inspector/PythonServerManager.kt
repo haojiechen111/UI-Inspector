@@ -4,21 +4,43 @@ import com.intellij.openapi.diagnostic.Logger
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.TimeUnit
 
 object PythonServerManager {
     private val LOG = Logger.getInstance(PythonServerManager::class.java)
     private var process: Process? = null
-    private const val SERVER_URL = "http://127.0.0.1:8000"
+    private const val DEFAULT_PORT = 18888
+    private var serverDir: File? = null
+
+    fun getServerPort(): Int {
+        // Try to read port from file
+        serverDir?.let { dir ->
+            val portFile = File(dir, "server_port.txt")
+            if (portFile.exists()) {
+                try {
+                    val port = portFile.readText().trim().toInt()
+                    LOG.info("Read server port from file: $port")
+                    return port
+                } catch (e: Exception) {
+                    LOG.warn("Failed to read port from file: ${e.message}")
+                }
+            }
+        }
+        // Fallback to default port
+        return DEFAULT_PORT
+    }
+
+    fun getServerURL(): String {
+        return "http://127.0.0.1:${getServerPort()}"
+    }
 
     fun start(pluginPath: String) {
+        serverDir = File(pluginPath, "server")
+        val mainScript = File(serverDir, "main.py")
+        
         if (isServerRunning()) {
-            LOG.info("Car UI Server is already running.")
+            LOG.info("Car UI Server is already running on ${getServerURL()}")
             return
         }
-
-        val serverDir = File(pluginPath, "server")
-        val mainScript = File(serverDir, "main.py")
 
         if (!mainScript.exists()) {
             LOG.error("Server script not found at ${mainScript.absolutePath}")
@@ -56,7 +78,7 @@ object PythonServerManager {
 
     fun isServerRunning(): Boolean {
         return try {
-            val url = URL(SERVER_URL)
+            val url = URL(getServerURL())
             val connection = url.openConnection() as HttpURLConnection
             connection.connectTimeout = 500
             connection.requestMethod = "GET"

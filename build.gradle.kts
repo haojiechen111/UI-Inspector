@@ -5,7 +5,53 @@ plugins {
 }
 
 group = "com.carui"
-version = "1.0-SNAPSHOT"
+
+// 自动版本号管理
+val versionFile = file("version.txt")
+val currentVersion = if (versionFile.exists()) {
+    versionFile.readText().trim()
+} else {
+    "1.0.0"
+}
+
+// 解析版本号并递增
+fun incrementVersion(version: String): String {
+    val parts = version.split(".")
+    if (parts.size != 3) return "1.0.0"
+    
+    var major = parts[0].toInt()
+    var minor = parts[1].toInt()
+    var patch = parts[2].toInt()
+    
+    patch++
+    if (patch >= 10) {
+        patch = 0
+        minor++
+        if (minor >= 10) {
+            minor = 0
+            major++
+        }
+    }
+    
+    return "$major.$minor.$patch"
+}
+
+// 在构建时递增版本号
+val newVersion = incrementVersion(currentVersion)
+version = newVersion
+
+// 保存新版本号
+tasks.register("updateVersion") {
+    doLast {
+        versionFile.writeText(newVersion)
+        println("✅ 版本号已更新: $currentVersion -> $newVersion")
+    }
+}
+
+// 在buildPlugin之前自动更新版本号
+tasks.named("buildPlugin") {
+    dependsOn("updateVersion")
+}
 
 repositories {
     mavenCentral()

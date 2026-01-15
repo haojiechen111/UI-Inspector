@@ -117,20 +117,8 @@ def refresh_display_mapping(serial: str):
                 })
 
         if not info_list:
-            # Fallback to hardcoded mapping found in diagnostics for this device
-            new_mapping = {
-                "0": "4630947208271169553",
-                "2": "4630946780669082146",
-                "4": "4630946953448788001",
-                "5": "4630947039749296163"
-            }
-            display_mapping = new_mapping
-            return [
-                {"id": "0", "description": "Main Driver (DP_0)"},
-                {"id": "2", "description": "Passenger (DP_2)"},
-                {"id": "4", "description": "Rear Left (DP_1)"},
-                {"id": "5", "description": "Rear Right (DP_3)"}
-            ]
+            # 如果无法获取display信息，返回None让调用方使用静态fallback
+            return None
 
         display_mapping = new_mapping
         display_info_cache = info_list
@@ -197,7 +185,7 @@ def get_devices():
                 "serial": d.serial,
                 "model": model,
                 "ss_type": ss_type,  # Will be "SS4", "SS3", etc. or None
-                "needs_init": ss_type is not None  # True if any SS device
+                "needs_init": ss_type == "SS4"  # Only SS4 needs init, not SS2/SS3
             }
             devices.append(device_info)
         return devices
@@ -283,17 +271,50 @@ def get_displays(serial: Optional[str] = None):
     if not target_serial:
         return []
     
+    # Detect device type for custom screen names
+    ss_type = detect_ss_device(target_serial)
+    print(f"[DISPLAYS] Device type: {ss_type}")
+    
     res = refresh_display_mapping(target_serial)
     if res:
+        # Customize screen names based on device type
+        for display in res:
+            display_id = display["id"]
+            if ss_type == "SS4":
+                # SS4: 中控屏，后排空调屏，hud屏，后排屏
+                if display_id == "0":
+                    display["description"] = "中控屏"
+                elif display_id == "2":
+                    display["description"] = "后排空调屏"
+                elif display_id == "4":
+                    display["description"] = "hud屏"
+                elif display_id == "5":
+                    display["description"] = "后排屏"
+            elif ss_type in ["SS2", "SS3"] or ss_type is None:
+                # SS2/SS3/其他: 中控屏，副驾屏，后排屏
+                if display_id == "0":
+                    display["description"] = "中控屏"
+                elif display_id == "2":
+                    display["description"] = "副驾屏"
+                elif display_id == "4":
+                    display["description"] = "后排屏"
         return res
     
-    # Static fallback based on user's known IDs if detection failed
-    return [
-        {"id": "0", "description": "Display 0 (Main)"},
-        {"id": "2", "description": "Display 2 (Passenger)"},
-        {"id": "4", "description": "Display 4 (Rear L)"},
-        {"id": "5", "description": "Display 5 (Rear R)"}
-    ]
+    # Static fallback based on device type
+    if ss_type == "SS4":
+        return [
+            {"id": "0", "description": "中控屏"},
+            {"id": "2", "description": "后排空调屏"},
+            {"id": "4", "description": "hud屏"},
+            {"id": "5", "description": "后排屏"}
+        ]
+    else:
+        # SS2/SS3/其他默认配置
+        return [
+            {"id": "0", "description": "中控屏"},
+            {"id": "2", "description": "副驾屏"},
+            {"id": "4", "description": "后排屏"}
+        ]
 
 @app.post("/api/connect")
 def connect_device(req: ConnectRequest):
@@ -329,8 +350,11 @@ def get_screenshot(display: str = "0"):
          raise HTTPException(status_code=400, detail="Device not connected")
     
     try:
+        print(f"[SCREENSHOT] 📸 请求截图 - Display ID: {display}, Device: {current_serial}")
+        
         # Use physical ID for screencap if available
         phys_id = display_mapping.get(display, display)
+        print(f"[SCREENSHOT] 🔄 物理ID映射: {display} -> {phys_id}")
         
         variations = []
         # Fallback 1: screencap -p (most compatible for display 0)
@@ -350,17 +374,23 @@ def get_screenshot(display: str = "0"):
         last_err = ""
         d = adb.device(serial=current_serial)
         
-        # Variation commands
+        # Variation commands - 优化顺序，优先使用logical ID
         cmd_variations = []
+        
+        # 对于非0 display，优先使用logical ID（因为某些设备physical ID映射可能不准确）
+        if display != "0":
+            print(f"[SCREENSHOT] 🎯 非主屏，优先尝试logical ID")
+            cmd_variations.append(f"screencap -d {display} -p")
+            cmd_variations.append(f"screencap -p -d {display}")
+        
+        # 然后尝试display 0的简化命令
         if display == "0":
             cmd_variations.append("screencap -p")
         
-        cmd_variations.append(f"screencap -d {phys_id} -p")
-        cmd_variations.append(f"screencap -p -d {phys_id}")
-        
+        # 最后尝试physical ID
         if phys_id != display:
-            cmd_variations.append(f"screencap -d {display} -p")
-            cmd_variations.append(f"screencap -p -d {display}")
+            cmd_variations.append(f"screencap -d {phys_id} -p")
+            cmd_variations.append(f"screencap -p -d {phys_id}")
 
         for cmd_str in cmd_variations:
             try:
@@ -407,31 +437,81 @@ def get_hierarchy(display: int = 0):
          raise HTTPException(status_code=400, detail="Device not connected")
     
     try:
+        import xml.etree.ElementTree as ET
         d = adb.device(serial=current_serial)
-        dump_path = f"/data/local/tmp/uidump_{display}.xml"
+        dump_path = f"/sdcard/uidump_{display}.xml"
         
-        # Try display-specific dump
-        res = d.shell(f"rm {dump_path}")
-        # uiautomator dump --display ID
-        # Some systems might not support --display, check error
-        cmd = f"uiautomator dump --display {display} {dump_path}"
-        if display == 0:
-            cmd = f"uiautomator dump {dump_path}"
-            
+        # Clear previous dump
+        d.shell(f"rm -f {dump_path}")
+        
+        # 方法1: 使用--windows参数获取所有窗口和层级(包括系统UI)
+        print(f"[Hierarchy] 尝试获取所有层级(包括系统UI)...")
+        cmd = f"uiautomator dump --windows {dump_path}"
         err = d.shell(cmd)
-        if "error" in err.lower() and display > 0:
-            # Fallback to default if display-specific fails, though it might return wrong data
-            print(f"Hierarchy dump failed for display {display}, error: {err}")
+        print(f"[Hierarchy] uiautomator dump --windows 输出: {err}")
         
+        # 读取dump的内容
         xml_content = d.shell(f"cat {dump_path}")
         
         if not xml_content or "<?xml" not in xml_content:
+            print(f"[Hierarchy] 默认dump失败,尝试指定display...")
+            # Fallback: 尝试指定display
+            d.shell(f"rm -f {dump_path}")
+            cmd = f"uiautomator dump --display {display} {dump_path}"
+            err = d.shell(cmd)
+            xml_content = d.shell(f"cat {dump_path}")
+            
+        if not xml_content or "<?xml" not in xml_content:
             raise Exception(f"Failed to dump hierarchy for display {display}")
 
+        # 清理XML内容
         start = xml_content.find("<?xml")
         end = xml_content.rfind(">")
         if start != -1 and end != -1:
             xml_content = xml_content[start:end+1]
+        
+        print(f"[Hierarchy] 成功获取UI层级,XML长度: {len(xml_content)}")
+        
+        # 处理多窗口XML格式：将所有窗口合并到单个hierarchy中
+        try:
+            root = ET.fromstring(xml_content)
+            
+            # 检查是否是多窗口格式 (<displays>)
+            if root.tag == 'displays':
+                print(f"[Hierarchy] 检测到多窗口格式，开始合并...")
+                # 创建一个新的hierarchy根节点
+                merged_hierarchy = ET.Element('hierarchy')
+                merged_hierarchy.set('rotation', '0')
+                
+                window_count = 0
+                # 遍历所有display下的所有window
+                for display_elem in root.findall('.//display'):
+                    display_id = display_elem.get('id', 'unknown')
+                    for window_elem in display_elem.findall('window'):
+                        window_count += 1
+                        window_title = window_elem.get('title', '')
+                        window_bounds = window_elem.get('bounds', '')
+                        window_type = window_elem.get('type', '')
+                        
+                        # 获取window下的hierarchy节点
+                        hierarchy_elem = window_elem.find('hierarchy')
+                        if hierarchy_elem is not None:
+                            # 将hierarchy下的所有node添加到merged_hierarchy
+                            for node in hierarchy_elem.findall('node'):
+                                # 为每个顶层node添加window信息作为注释属性
+                                node_copy = ET.fromstring(ET.tostring(node))
+                                merged_hierarchy.append(node_copy)
+                
+                print(f"[Hierarchy] 合并了 {window_count} 个窗口的节点")
+                xml_content = ET.tostring(merged_hierarchy, encoding='unicode')
+                xml_content = '<?xml version="1.0" encoding="UTF-8"?>' + xml_content
+                print(f"[Hierarchy] 合并后XML长度: {len(xml_content)}")
+            else:
+                print(f"[Hierarchy] 单窗口格式，无需合并")
+        except Exception as parse_error:
+            print(f"[Hierarchy] XML解析/合并出错: {parse_error}")
+            # 如果解析失败，返回原始XML
+            pass
         
         return {"xml": xml_content}
     except Exception as e:
@@ -508,5 +588,39 @@ def back_button(req: BackRequest):
 def read_root():
     return JSONResponse(content={"message": "Car UI Tool API is running. Go to /static/index.html"})
 
+def find_available_port(start_port=18888, max_attempts=10):
+    """Find an available port starting from start_port"""
+    import socket
+    
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            # Try to bind to the port
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('127.0.0.1', port))
+            sock.close()
+            print(f"✅ Port {port} is available")
+            return port
+        except OSError:
+            print(f"❌ Port {port} is already in use, trying next...")
+            continue
+    
+    # If no port found, raise error
+    raise RuntimeError(f"No available port found in range {start_port}-{start_port + max_attempts - 1}")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Find available port
+    try:
+        port = find_available_port(start_port=18888, max_attempts=10)
+        print(f"🚀 Starting server on port {port}")
+        
+        # Write port to file for plugin to read
+        port_file = os.path.join(os.path.dirname(__file__), "server_port.txt")
+        with open(port_file, 'w') as f:
+            f.write(str(port))
+        print(f"📝 Port number saved to {port_file}")
+        
+        # Start server
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except Exception as e:
+        print(f"❌ Failed to start server: {e}")
+        sys.exit(1)

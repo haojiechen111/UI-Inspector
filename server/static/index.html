@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>车载 UI 工具</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=4">
 </head>
 
 <body>
@@ -32,6 +32,7 @@
             </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
             <span id="status" class="status-badge">未连接</span>
+            <button class="btn-icon" onclick="showSettingsModal()" title="搜索高亮设置">🔍</button>
         </div>
     </div>
 
@@ -134,7 +135,45 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal" onclick="closeSettingsModal(event)">
+        <div class="modal-content settings-modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>🔍 搜索高亮设置</h3>
+                <button class="modal-close" onclick="closeSettingsModal()">×</button>
+            </div>
+            <div class="modal-body settings-body">
+                <div class="settings-section">
+                    <label class="settings-label">添加搜索关键字:</label>
+                    <div class="pattern-input-group">
+                        <input type="text" id="newPattern" class="settings-input" placeholder="输入搜索关键词（如：clickable）..." onkeypress="if(event.key==='Enter') addPattern()">
+                        <button class="btn-primary btn-small" onclick="addPattern()">➕ 添加</button>
+                    </div>
+                </div>
+                
+                <div class="settings-section">
+                    <label class="settings-label">搜索关键字列表 (每个关键字独立配色):</label>
+                    <div id="patternList" class="pattern-list-new">
+                        <div class="empty-state" style="padding: 15px; font-size: 13px; color: #9ca3af;">暂无搜索关键字<br><small style="font-size: 11px;">添加关键字后，可为每个关键字设置独立的高亮颜色</small></div>
+                    </div>
+                </div>
+                
+                <div class="settings-section">
+                    <label class="settings-checkbox">
+                        <input type="checkbox" id="ignoreCase" checked>
+                        <span>忽略大小写匹配</span>
+                    </label>
+                </div>
+                
+                <div class="settings-actions">
+                    <button class="btn-primary" onclick="applySettings()">✓ 应用设置</button>
+                    <button class="btn-secondary" onclick="resetSettings()">↺ 重置全部</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js?v=3"></script>
 </body>
 
 </html>

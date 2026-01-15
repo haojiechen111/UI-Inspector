@@ -16,6 +16,53 @@ let hoverNode = null; // New for hover
 let screenImage = new Image();
 let mapNodeToDom = new Map();
 
+// Settings state - 每个关键字都有独立的颜色配置
+let searchSettings = {
+    patterns: [],  // 每个元素是 { text, foreColor, backColor }
+    ignoreCase: true
+};
+
+// 预设颜色方案（用于自动分配）
+const colorPresets = [
+    { foreColor: '#60a5fa', backColor: '#1e3a5f' },  // 蓝色
+    { foreColor: '#f59e0b', backColor: '#78350f' },  // 橙色
+    { foreColor: '#10b981', backColor: '#064e3b' },  // 绿色
+    { foreColor: '#ef4444', backColor: '#7f1d1d' },  // 红色
+    { foreColor: '#a78bfa', backColor: '#4c1d95' },  // 紫色
+    { foreColor: '#ec4899', backColor: '#831843' },  // 粉色
+    { foreColor: '#14b8a6', backColor: '#134e4a' },  // 青色
+    { foreColor: '#f97316', backColor: '#7c2d12' },  // 深橙
+];
+
+// 4x4 固定颜色选择器（用于文字色和背景色）
+const fixedColors = [
+    // 第一行 - 浅色系
+    '#ffffff', '#e0e0e0', '#ffcdd2', '#f8bbd0',
+    // 第二行 - 亮色系
+    '#60a5fa', '#10b981', '#f59e0b', '#ef4444',
+    // 第三行 - 深色系
+    '#1e3a5f', '#064e3b', '#78350f', '#7f1d1d',
+    // 第四行 - 其他颜色
+    '#a78bfa', '#ec4899', '#14b8a6', '#f97316'
+];
+
+// Load settings from localStorage
+function loadSettings() {
+    const saved = localStorage.getItem('uiInspectorSettings');
+    if (saved) {
+        try {
+            searchSettings = JSON.parse(saved);
+        } catch (e) {
+            console.error('Failed to load settings:', e);
+        }
+    }
+}
+
+// Save settings to localStorage
+function saveSettings() {
+    localStorage.setItem('uiInspectorSettings', JSON.stringify(searchSettings));
+}
+
 // Modal functions
 function showDeviceModal() {
     const modal = document.getElementById('deviceModal');
@@ -39,6 +86,217 @@ function closeDisplayModal(event) {
     if (event && event.target !== event.currentTarget) return;
     const modal = document.getElementById('displayModal');
     modal.classList.remove('show');
+}
+
+function showSettingsModal() {
+    const modal = document.getElementById('settingsModal');
+    modal.classList.add('show');
+    
+    // Populate settings - 只更新模式列表和 ignoreCase
+    updatePatternList();
+    document.getElementById('ignoreCase').checked = searchSettings.ignoreCase;
+}
+
+// 模式列表管理函数 - 每个关键字独立配色
+function addPattern() {
+    const input = document.getElementById('newPattern');
+    const text = input.value.trim();
+    
+    if (!text) {
+        alert('请输入搜索关键词！');
+        return;
+    }
+    
+    // 检查是否已存在
+    if (searchSettings.patterns.some(p => p.text === text)) {
+        alert('该搜索关键字已存在！');
+        return;
+    }
+    
+    // 自动分配颜色（循环使用预设颜色）
+    const colorIndex = searchSettings.patterns.length % colorPresets.length;
+    const colors = colorPresets[colorIndex];
+    
+    // 添加新的pattern对象
+    searchSettings.patterns.push({
+        text: text,
+        foreColor: colors.foreColor,
+        backColor: colors.backColor
+    });
+    
+    input.value = '';
+    updatePatternList();
+    saveSettings();
+}
+
+function removePattern(index) {
+    if (index >= 0 && index < searchSettings.patterns.length) {
+        searchSettings.patterns.splice(index, 1);
+        updatePatternList();
+        saveSettings();
+    }
+}
+
+function updatePatternColor(index, colorType, value) {
+    if (index >= 0 && index < searchSettings.patterns.length) {
+        searchSettings.patterns[index][colorType] = value;
+        saveSettings();
+    }
+}
+
+function updatePatternList() {
+    const listContainer = document.getElementById('patternList');
+    
+    if (searchSettings.patterns.length === 0) {
+        listContainer.innerHTML = '<div class="empty-state" style="padding: 15px; font-size: 13px; color: #9ca3af;">暂无搜索关键字<br><small style="font-size: 11px;">添加关键字后，可为每个关键字设置独立的高亮颜色</small></div>';
+        return;
+    }
+    
+    listContainer.innerHTML = '';
+    searchSettings.patterns.forEach((pattern, index) => {
+        const item = document.createElement('div');
+        item.className = 'pattern-item-row';
+        
+        // 关键字文本
+        const textSpan = document.createElement('span');
+        textSpan.className = 'pattern-text';
+        textSpan.innerText = pattern.text;
+        textSpan.style.color = pattern.foreColor;
+        textSpan.style.backgroundColor = pattern.backColor;
+        item.appendChild(textSpan);
+        
+        // 颜色选择器容器
+        const colorsDiv = document.createElement('div');
+        colorsDiv.className = 'pattern-colors';
+        
+        // 文字色选择器按钮
+        const foreColorBtn = document.createElement('button');
+        foreColorBtn.className = 'color-picker-btn';
+        foreColorBtn.style.backgroundColor = pattern.foreColor;
+        foreColorBtn.title = '文字颜色';
+        foreColorBtn.onclick = (e) => {
+            e.stopPropagation();
+            showColorPicker(index, 'foreColor', pattern.foreColor, foreColorBtn, textSpan);
+        };
+        colorsDiv.appendChild(foreColorBtn);
+        
+        // 背景色选择器按钮
+        const backColorBtn = document.createElement('button');
+        backColorBtn.className = 'color-picker-btn';
+        backColorBtn.style.backgroundColor = pattern.backColor;
+        backColorBtn.title = '背景颜色';
+        backColorBtn.onclick = (e) => {
+            e.stopPropagation();
+            showColorPicker(index, 'backColor', pattern.backColor, backColorBtn, textSpan);
+        };
+        colorsDiv.appendChild(backColorBtn);
+        
+        item.appendChild(colorsDiv);
+        
+        // 删除按钮
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'pattern-remove-btn';
+        removeBtn.innerText = '×';
+        removeBtn.title = '删除此关键字';
+        removeBtn.onclick = () => removePattern(index);
+        item.appendChild(removeBtn);
+        
+        listContainer.appendChild(item);
+    });
+}
+
+// 显示颜色选择器弹窗
+function showColorPicker(patternIndex, colorType, currentColor, targetBtn, textSpan) {
+    // 移除已存在的选择器
+    const existing = document.querySelector('.color-picker-popup');
+    if (existing) existing.remove();
+    
+    // 创建弹窗
+    const popup = document.createElement('div');
+    popup.className = 'color-picker-popup';
+    
+    // 创建4x4颜色网格
+    const grid = document.createElement('div');
+    grid.className = 'color-grid';
+    
+    fixedColors.forEach(color => {
+        const colorBox = document.createElement('div');
+        colorBox.className = 'color-box';
+        colorBox.style.backgroundColor = color;
+        if (color.toLowerCase() === currentColor.toLowerCase()) {
+            colorBox.classList.add('selected');
+        }
+        colorBox.onclick = () => {
+            updatePatternColor(patternIndex, colorType, color);
+            targetBtn.style.backgroundColor = color;
+            if (colorType === 'foreColor') {
+                textSpan.style.color = color;
+            } else {
+                textSpan.style.backgroundColor = color;
+            }
+            popup.remove();
+        };
+        grid.appendChild(colorBox);
+    });
+    
+    popup.appendChild(grid);
+    
+    // 定位弹窗
+    const rect = targetBtn.getBoundingClientRect();
+    popup.style.position = 'fixed';
+    popup.style.left = rect.left + 'px';
+    popup.style.top = (rect.bottom + 5) + 'px';
+    
+    document.body.appendChild(popup);
+    
+    // 点击外部关闭
+    const closePopup = (e) => {
+        if (!popup.contains(e.target) && e.target !== targetBtn) {
+            popup.remove();
+            document.removeEventListener('click', closePopup);
+        }
+    };
+    setTimeout(() => {
+        document.addEventListener('click', closePopup);
+    }, 0);
+}
+
+function closeSettingsModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = document.getElementById('settingsModal');
+    modal.classList.remove('show');
+}
+
+function applySettings() {
+    // 只保存 ignoreCase，每个关键字都有独立的颜色配置
+    searchSettings.ignoreCase = document.getElementById('ignoreCase').checked;
+    
+    saveSettings();
+    closeSettingsModal();
+    
+    // Refresh tree view to apply new settings
+    if (rootNode) {
+        const treeList = document.createElement('div');
+        traverseAndBuildTree(rootNode, treeList);
+        treeContainer.innerHTML = '';
+        treeContainer.appendChild(treeList);
+    }
+    
+    // Refresh properties view if node is selected
+    if (selectedNode) {
+        const attrs = getAttributes(selectedNode);
+        renderProperties(attrs);
+    }
+}
+
+function resetSettings() {
+    // 重置为默认设置 - 只保留 patterns 数组和 ignoreCase
+    searchSettings = {
+        patterns: [],
+        ignoreCase: true
+    };
+    saveSettings();
+    showSettingsModal(); // Refresh the modal with default values
 }
 
 function updateDeviceModalList() {
@@ -120,8 +378,16 @@ function updateDisplayModalList() {
 function selectDevice(device) {
     currentDevice = device;
     const btn = document.getElementById('deviceSelectText');
-    const ssLabel = device.ss_type ? ` [${device.ss_type}]` : '';
-    btn.innerText = `${device.model} (${device.serial})${ssLabel}`;
+    // 显示设备型号，如果是SS设备则显示SS类型，否则显示model
+    const displayName = device.ss_type || device.model;
+    btn.innerText = displayName;
+    
+    // Add subtle animation
+    btn.style.transform = 'scale(0.98)';
+    setTimeout(() => {
+        btn.style.transform = 'scale(1)';
+    }, 100);
+    
     onDeviceChanged();
 }
 
@@ -129,16 +395,23 @@ function selectDisplay(displayId, description) {
     currentDisplay = displayId;
     const btn = document.getElementById('displaySelectText');
     btn.innerText = description;
-    refreshSnapshot();
+    
+    // Add subtle animation
+    btn.style.transform = 'scale(0.98)';
+    setTimeout(() => {
+        btn.style.transform = 'scale(1)';
+    }, 100);
+    
+    // 只更新选择状态，不自动刷新快照
+    // 用户需要点击"连接设备"按钮来连接和刷新
+    console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description);
 }
 
 // Init
 window.onload = () => {
-    refreshDeviceList();
+    loadSettings(); // Load settings from localStorage
+    refreshDeviceList(); // 只加载设备列表，不自动连接
 };
-
-// Track if we've already auto-connected to avoid repeated connections
-let hasAutoConnected = false;
 
 // Toast notification helpers
 let toastTimeout = null;
@@ -196,7 +469,11 @@ function clearLog() {
 async function refreshDeviceList(autoConnect = false) {
     console.log("[RefreshDeviceList] 开始获取设备列表... autoConnect:", autoConnect);
     const btn = document.getElementById('deviceSelectText');
-    btn.innerText = '正在获取设备...';
+    
+    // 如果已经有设备，不要覆盖按钮文本
+    if (!currentDevice) {
+        btn.innerText = '正在获取设备...';
+    }
     
     try {
         const res = await fetch('/api/devices');
@@ -209,17 +486,20 @@ async function refreshDeviceList(autoConnect = false) {
             return;
         }
 
-        // Select first device by default
+        // 只选择第一个设备作为默认选择，不自动连接
         if (devicesList.length > 0 && !currentDevice) {
             currentDevice = devicesList[0];
-            selectDevice(currentDevice);
+            const displayName = currentDevice.ss_type || currentDevice.model;
+            btn.innerText = displayName;
+            console.log("[RefreshDeviceList] 默认选择第一个设备:", currentDevice.serial);
+            
+            // 只获取显示列表，不连接
+            onDeviceChanged();
         }
         
-        // Auto-connect if requested
-        if (autoConnect || !hasAutoConnected) {
-            const firstDevice = devicesList[0];
-            hasAutoConnected = true;
-            console.log(`[AutoConnect] 自动连接到: ${firstDevice.serial}`);
+        // 仅在明确请求自动连接时才连接（点击刷新按钮时）
+        if (autoConnect) {
+            console.log(`[AutoConnect] 用户请求自动连接到: ${currentDevice.serial}`);
             
             clearLog();
             showToast();
@@ -228,16 +508,14 @@ async function refreshDeviceList(autoConnect = false) {
             statusEl.innerText = '正在连接...';
             statusEl.style.color = '#f59e0b';
             
-            addLogEntry(`🔍 检测到设备: ${firstDevice.model}`, 'info');
-            addLogEntry(`📱 Serial: ${firstDevice.serial}`, 'info');
-            if (firstDevice.ss_type) {
-                addLogEntry(`⚙️ 设备类型: ${firstDevice.ss_type} (需要初始化)`, 'warning');
+            addLogEntry(`🔍 检测到设备: ${currentDevice.model}`, 'info');
+            addLogEntry(`📱 Serial: ${currentDevice.serial}`, 'info');
+            if (currentDevice.ss_type) {
+                addLogEntry(`⚙️ 设备类型: ${currentDevice.ss_type} (需要初始化)`, 'warning');
             } else {
                 addLogEntry(`✅ 普通Android设备`, 'info');
             }
             
-            currentDevice = firstDevice;
-            selectDevice(firstDevice);
             setTimeout(() => connectDevice(), 500);
         }
     } catch (e) {
@@ -247,9 +525,11 @@ async function refreshDeviceList(autoConnect = false) {
         statusEl.style.color = '#ef4444';
         btn.innerText = '获取设备失败';
         
-        clearLog();
-        showToast();
-        addLogEntry(`❌ 获取设备失败: ${e.message}`, 'error');
+        if (autoConnect) {
+            clearLog();
+            showToast();
+            addLogEntry(`❌ 获取设备失败: ${e.message}`, 'error');
+        }
     }
 }
 
@@ -259,8 +539,9 @@ async function onDeviceChanged() {
     refreshDisplayList();
 }
 
-async function refreshDisplayList() {
+async function refreshDisplayList(keepCurrentSelection = false) {
     const btn = document.getElementById('displaySelectText');
+    const previousDisplay = currentDisplay; // 保存用户当前选择的display
     btn.innerText = '正在获取屏幕...';
     
     try {
@@ -271,6 +552,21 @@ async function refreshDisplayList() {
         console.log("Displays received:", displaysList);
         
         if (displaysList.length > 0) {
+            // 如果需要保持当前选择，且当前选择的display还在列表中，就保持不变
+            if (keepCurrentSelection && previousDisplay) {
+                const displayExists = displaysList.some(d => d.id === previousDisplay);
+                if (displayExists) {
+                    // 用户选择的display还在列表中，保持选择
+                    console.log("[RefreshDisplayList] 保持用户选择的display:", previousDisplay);
+                    const displayInfo = displaysList.find(d => d.id === previousDisplay);
+                    if (displayInfo) {
+                        selectDisplay(displayInfo.id, displayInfo.description);
+                    }
+                    return;
+                }
+            }
+            
+            // 否则选择第一个display（初次加载或用户选择的display不存在了）
             currentDisplay = displaysList[0].id;
             selectDisplay(displaysList[0].id, displaysList[0].description);
         }
@@ -294,6 +590,10 @@ async function connectDevice() {
     
     console.log(`[ConnectDevice] 开始连接设备: ${serial}`);
     console.log(`[ConnectDevice] 设备信息 - Serial: ${serial}, SS类型: ${ssType}, 需要初始化: ${needsInit}`);
+    
+    // 显示连接日志Toast
+    clearLog();
+    showToast();
     addLogEntry(`🚀 开始连接设备: ${serial}`, 'info');
 
     loading.classList.remove('hidden');
@@ -349,7 +649,13 @@ async function connectDevice() {
             
             // Refresh device list to include localhost:5559
             console.log("[ConnectDevice] 刷新设备列表...");
-            await refreshDeviceList();
+            await refreshDeviceList(false); // false = don't auto-connect
+            
+            // Update currentDevice to the new localhost:5559 for SS4
+            currentDevice = {
+                ...currentDevice,
+                serial: targetSerial
+            };
             
             console.log(`[ConnectDevice] 已切换到新serial: ${targetSerial}`);
         } else {
@@ -357,10 +663,10 @@ async function connectDevice() {
             addLogEntry(`✅ 普通Android设备，直接连接`, 'info');
         }
         
-        // Step 2: Refresh display list
+        // Step 2: Refresh display list (保持用户选择的display)
         console.log("[ConnectDevice] 刷新显示列表...");
         addLogEntry(`🖥️ 检测显示屏幕...`, 'info');
-        await refreshDisplayList();
+        await refreshDisplayList(true); // true = 保持用户当前选择的display
 
         // Step 3: Connect to the device
         console.log(`[ConnectDevice] 连接到设备: ${targetSerial}`);
@@ -587,10 +893,37 @@ function traverseAndBuildTree(xmlNode, parentElement) {
 
     const textSpan = document.createElement('span');
     textSpan.className = 'node-text';
-    textSpan.innerText = label;
+    
+    // 应用搜索高亮 - 每个关键字独立配色
+    if (searchSettings.patterns && searchSettings.patterns.length > 0) {
+        let highlighted = label;
+        let matchedPattern = null;
+        
+        // 找到第一个匹配的pattern
+        for (const pattern of searchSettings.patterns) {
+            if (pattern && pattern.text && pattern.text.trim() !== '') {
+                if (textMatches(label, pattern.text, searchSettings.ignoreCase)) {
+                    matchedPattern = pattern;
+                    break;
+                }
+            }
+        }
+        
+        // 如果有匹配，应用该pattern的颜色和高亮
+        if (matchedPattern) {
+            highlighted = highlightTextWithColor(highlighted, matchedPattern.text, matchedPattern.foreColor, searchSettings.ignoreCase);
+            content.style.backgroundColor = matchedPattern.backColor;
+        }
+        
+        textSpan.innerHTML = highlighted;
+    } else {
+        textSpan.innerText = label;
+    }
+    
     content.appendChild(textSpan);
 
     content.onclick = (e) => {
+        e.stopPropagation(); // 阻止事件冒泡到父节点
         document.querySelectorAll('.tree-content.selected').forEach(el => el.classList.remove('selected'));
         content.classList.add('selected');
         selectNode(xmlNode);
@@ -722,11 +1055,79 @@ function renderProperties(attrs) {
     table.id = 'props-table';
     let html = '';
     const sortedKeys = Object.keys(attrs).sort();
+    
+    // 应用搜索高亮到属性面板 - 每个关键字独立配色
+    const hasPatterns = searchSettings.patterns && searchSettings.patterns.length > 0;
+    
     for (const key of sortedKeys) {
-        html += `<tr><th>${key}</th><td>${attrs[key]}</td></tr>`;
+        const value = attrs[key];
+        let keyHtml = key;
+        let valueHtml = value;
+        let rowStyle = '';
+        let matchedPattern = null;
+        
+        if (hasPatterns) {
+            // 找到第一个匹配的 pattern
+            for (const pattern of searchSettings.patterns) {
+                if (pattern && pattern.text && pattern.text.trim() !== '') {
+                    const keyMatch = textMatches(key, pattern.text, searchSettings.ignoreCase);
+                    const valueMatch = textMatches(value, pattern.text, searchSettings.ignoreCase);
+                    
+                    if (keyMatch || valueMatch) {
+                        matchedPattern = pattern;
+                        if (keyMatch) {
+                            keyHtml = highlightTextWithColor(keyHtml, pattern.text, pattern.foreColor, searchSettings.ignoreCase);
+                        }
+                        if (valueMatch) {
+                            valueHtml = highlightTextWithColor(valueHtml, pattern.text, pattern.foreColor, searchSettings.ignoreCase);
+                        }
+                        break; // 使用第一个匹配的 pattern
+                    }
+                }
+            }
+            
+            // 应用匹配 pattern 的背景色
+            if (matchedPattern) {
+                rowStyle = ` style="background-color: ${matchedPattern.backColor};"`;
+            }
+        }
+        
+        html += `<tr${rowStyle}><th>${keyHtml}</th><td>${valueHtml}</td></tr>`;
     }
+    
     table.innerHTML = html;
     propsContainer.appendChild(table);
+}
+
+// 搜索匹配辅助函数
+function textMatches(text, pattern, ignoreCase) {
+    if (!text || !pattern) return false;
+    const searchText = ignoreCase ? text.toLowerCase() : text;
+    const searchPattern = ignoreCase ? pattern.toLowerCase() : pattern;
+    return searchText.includes(searchPattern);
+}
+
+function highlightText(text, pattern, ignoreCase) {
+    if (!text || !pattern) return text;
+    
+    const flags = ignoreCase ? 'gi' : 'g';
+    const regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+    
+    return text.replace(regex, (match) => {
+        return `<span style="color: ${searchSettings.foreColor}; font-weight: bold; text-decoration: underline;">${match}</span>`;
+    });
+}
+
+// 使用指定颜色高亮文本
+function highlightTextWithColor(text, pattern, foreColor, ignoreCase) {
+    if (!text || !pattern) return text;
+    
+    const flags = ignoreCase ? 'gi' : 'g';
+    const regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+    
+    return text.replace(regex, (match) => {
+        return `<span style="color: ${foreColor}; font-weight: bold; text-decoration: underline;">${match}</span>`;
+    });
 }
 
 function drawHighlight(xmlNode, strokeColor = '#ef4444', fillColor = 'rgba(239, 68, 68, 0.2)') {
@@ -802,10 +1203,18 @@ canvas.onmousemove = (e) => {
 };
 
 canvas.onmouseup = (e) => {
-    if (!isDragging) return;
+    const coords = getCanvasCoords(e);
+    
+    // 如果不是拖拽状态，处理为简单点击
+    if (!isDragging) {
+        const realControl = document.getElementById('realControl');
+        const isRealControl = realControl && realControl.checked;
+        handleClick(coords.x, coords.y, isRealControl);
+        return;
+    }
+    
     isDragging = false;
 
-    const coords = getCanvasCoords(e);
     const endX = coords.rawX;
     const endY = coords.rawY;
     const dist = Math.sqrt(Math.pow(endX - startX, 2) + Math.pow(endY - startY, 2));
@@ -841,10 +1250,24 @@ function handleClick(x, y, isRealControl) {
     // 2. Inspection Logic (Always inspect on click)
     if (rootNode) {
         const allHits = findAllNodesAt(rootNode, x, y);
+        console.log(`[HandleClick] 点击坐标 (${x}, ${y}), 找到 ${allHits.length} 个匹配节点`);
+        
+        // 打印所有匹配节点的信息
+        allHits.forEach((node, index) => {
+            const attrs = getAttributes(node);
+            const bounds = attrs['bounds'];
+            const className = attrs['class'] || 'unknown';
+            const resourceId = attrs['resource-id'] || '';
+            console.log(`  [${index}] ${className} ${resourceId} bounds=${bounds}`);
+        });
+        
         const bestNode = pickBestNode(allHits);
-
         if (bestNode) {
+            const attrs = getAttributes(bestNode);
+            console.log(`[HandleClick] 选中最佳节点: ${attrs['class'] || 'unknown'} bounds=${attrs['bounds']}`);
             selectNode(bestNode);
+        } else {
+            console.log(`[HandleClick] 未找到匹配节点`);
         }
     }
 }
