@@ -28,6 +28,9 @@ object PythonServerManager {
     private const val DEFAULT_PORT = 18888
     private var serverDir: File? = null
     private var lastCheckResult: DependencyCheckResult? = null
+    private var monitorThread: Thread? = null
+    private var shouldMonitor = false
+    private var pluginPathCache: String? = null
 
     fun getServerPort(): Int {
         // Try to read port from file
@@ -321,12 +324,16 @@ object PythonServerManager {
 
     fun getLastCheckResult(): DependencyCheckResult? = lastCheckResult
 
-    fun start(pluginPath: String): String? {
+    fun start(pluginPath: String, enableMonitoring: Boolean = true): String? {
+        pluginPathCache = pluginPath
         serverDir = File(pluginPath, "server")
         val mainScript = File(serverDir, "main.py")
         
         if (isServerRunning()) {
             LOG.info("Car UI Server is already running on ${getServerURL()}")
+            if (enableMonitoring && !shouldMonitor) {
+                startMonitoring()
+            }
             return null
         }
 
@@ -346,6 +353,10 @@ object PythonServerManager {
         
         try {
             process = pb.start()
+            LOG.info("Server process started successfully")
+            if (enableMonitoring) {
+                startMonitoring()
+            }
             return null
         } catch (e: Exception) {
             LOG.error("Failed to start with 'python3', trying 'python': ${e.message}")
@@ -355,6 +366,10 @@ object PythonServerManager {
                pb2.redirectErrorStream(true)
                pb2.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
                process = pb2.start()
+               LOG.info("Server process started successfully with 'python'")
+               if (enableMonitoring) {
+                   startMonitoring()
+               }
                return null
             } catch (e2: Exception) {
                val error = "Python启动失败：${e2.message}"
@@ -362,6 +377,99 @@ object PythonServerManager {
                return error
             }
         }
+    }
+
+    /**
+     * 启动进程监控线程
+     * 自动检测服务崩溃并重启
+     */
+    private fun startMonitoring() {
+        // 如果已经在监控，先停止
+        stopMonitoring()
+        
+        shouldMonitor = true
+        monitorThread = Thread {
+            LOG.info("Server monitoring thread started")
+            var consecutiveFailures = 0
+            val maxConsecutiveFailures = 3
+            
+            while (shouldMonitor) {
+                try {
+                    Thread.sleep(5000) // 每5秒检查一次
+                    
+                    if (!shouldMonitor) break
+                    
+                    // 检查进程是否存活
+                    val processAlive = process?.isAlive ?: false
+                    val serverResponding = isServerRunning()
+                    
+                    if (!processAlive || !serverResponding) {
+                        consecutiveFailures++
+                        LOG.warn("Server not responding (attempt $consecutiveFailures/$maxConsecutiveFailures)")
+                        
+                        if (consecutiveFailures >= maxConsecutiveFailures) {
+                            LOG.error("Server failed $consecutiveFailures times, attempting restart...")
+                            
+                            // 尝试重启
+                            pluginPathCache?.let { path ->
+                                stop()
+                                Thread.sleep(2000) // 等待2秒确保端口释放
+                                
+                                val restartError = start(path, enableMonitoring = false) // 重启时暂不启动监控，避免递归
+                                if (restartError == null) {
+                                    LOG.info("Server restarted successfully")
+                                    consecutiveFailures = 0
+                                    // 重新启动监控
+                                    if (shouldMonitor) {
+                                        Thread.sleep(3000) // 等待服务器稳定
+                                    }
+                                } else {
+                                    LOG.error("Failed to restart server: $restartError")
+                                }
+                            }
+                        }
+                    } else {
+                        // 服务正常，重置失败计数
+                        if (consecutiveFailures > 0) {
+                            LOG.info("Server recovered, resetting failure count")
+                            consecutiveFailures = 0
+                        }
+                    }
+                } catch (e: InterruptedException) {
+                    LOG.info("Monitoring thread interrupted")
+                    break
+                } catch (e: Exception) {
+                    LOG.error("Error in monitoring thread: ${e.message}")
+                }
+            }
+            LOG.info("Server monitoring thread stopped")
+        }.apply {
+            isDaemon = true
+            name = "CarUI-ServerMonitor"
+            start()
+        }
+    }
+
+    /**
+     * 停止进程监控
+     */
+    private fun stopMonitoring() {
+        shouldMonitor = false
+        monitorThread?.interrupt()
+        monitorThread = null
+    }
+
+    /**
+     * 手动重启服务器
+     */
+    fun restart(): String? {
+        LOG.info("Manual server restart requested")
+        pluginPathCache?.let { path ->
+            stop()
+            Thread.sleep(2000) // 等待端口释放
+            return start(path, enableMonitoring = true)
+        }
+        return "无法重启：插件路径未缓存"
     }
 
     fun getServerLog(): String {

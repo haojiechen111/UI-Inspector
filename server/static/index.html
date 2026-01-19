@@ -14,6 +14,10 @@
         <div class="brand">
             <span class="logo-icon">🚗</span>
             <h1>Car UI Inspector</h1>
+            <div id="coordDisplay" class="coord-display hidden">
+                <span class="coord-label">坐标</span>
+                <span class="coord-value" id="coordValue">-</span>
+            </div>
         </div>
         <div class="controls">
             <div class="control-group">
@@ -30,9 +34,17 @@
                 </button>
                 <button class="btn-icon" onclick="refreshDisplayList()" title="刷新屏幕列表">🔄</button>
             </div>
+            <div class="control-group">
+                <label class="toggle-switch" title="选择数据源：UIAutomator或辅助服务" style="margin-right: 10px;">
+                    <input type="checkbox" id="useAccessibilityService">
+                    <span class="slider"></span>
+                    <span class="label-text" id="dataSourceLabel">UIAutomator</span>
+                </label>
+            </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
             <span id="status" class="status-badge">未连接</span>
             <button class="btn-icon" onclick="showSettingsModal()" title="搜索高亮设置">🔍</button>
+            <button class="btn-restart" onclick="restartServer()" title="重启Python服务器进程">🔄 重启服务</button>
         </div>
     </div>
 
@@ -173,7 +185,7 @@
         </div>
     </div>
 
-    <script src="app.js?v=3"></script>
+    <script src="app.js?v=4"></script>
 </body>
 
 </html>

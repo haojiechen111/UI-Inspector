@@ -402,15 +402,108 @@ function selectDisplay(displayId, description) {
         btn.style.transform = 'scale(1)';
     }, 100);
     
-    // 只更新选择状态，不自动刷新快照
-    // 用户需要点击"连接设备"按钮来连接和刷新
-    console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description);
+    // 只是选择display，不自动连接或刷新
+    console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description, "- 需要点击'连接设备'按钮才会连接");
 }
 
 // Init
 window.onload = () => {
     loadSettings(); // Load settings from localStorage
     refreshDeviceList(); // 只加载设备列表，不自动连接
+    
+    // 监听数据源开关变化
+    const dataSourceSwitch = document.getElementById('useAccessibilityService');
+    const dataSourceLabel = document.getElementById('dataSourceLabel');
+    
+    if (dataSourceSwitch && dataSourceLabel) {
+        dataSourceSwitch.addEventListener('change', async function() {
+            if (this.checked) {
+                // 切换到辅助服务模式 - 需要启用辅助服务
+                dataSourceLabel.textContent = '辅助服务 (启用中...)';
+                console.log('[DataSource] 切换到辅助服务模式，正在启用...');
+                
+                try {
+                    const response = await fetch('/api/accessibility/enable', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('[DataSource] ✅ 辅助服务已启用:', data);
+                        dataSourceLabel.textContent = '辅助服务';
+                        
+                        // 显示提示
+                        if (data.already_enabled) {
+                            console.log('[DataSource] 辅助服务已经处于启用状态');
+                        } else {
+                            console.log('[DataSource] 辅助服务启用成功');
+                            // 可以选择显示一个提示
+                            const statusEl = document.getElementById('status');
+                            if (statusEl) {
+                                const originalText = statusEl.innerText;
+                                statusEl.innerText = '✅ 辅助服务已启用';
+                                statusEl.style.color = '#10b981';
+                                setTimeout(() => {
+                                    statusEl.innerText = originalText;
+                                    statusEl.style.color = '#10b981';
+                                }, 2000);
+                            }
+                        }
+                    } else {
+                        const errorText = await response.text();
+                        console.error('[DataSource] ❌ 启用辅助服务失败:', errorText);
+                        dataSourceLabel.textContent = '辅助服务 (启用失败)';
+                        alert(`启用辅助服务失败: ${errorText}\n\n请检查：\n1. 设备是否已连接\n2. 是否已安装辅助服务APK`);
+                        // 恢复开关状态
+                        this.checked = false;
+                        dataSourceLabel.textContent = 'UIAutomator';
+                        return;
+                    }
+                } catch (error) {
+                    console.error('[DataSource] ❌ 启用辅助服务异常:', error);
+                    dataSourceLabel.textContent = '辅助服务 (启用失败)';
+                    alert(`启用辅助服务失败: ${error.message}`);
+                    // 恢复开关状态
+                    this.checked = false;
+                    dataSourceLabel.textContent = 'UIAutomator';
+                    return;
+                }
+            } else {
+                // 切换到UIAutomator模式 - 禁用辅助服务
+                dataSourceLabel.textContent = 'UIAutomator (禁用中...)';
+                console.log('[DataSource] 切换到UIAutomator模式，正在禁用辅助服务...');
+                
+                try {
+                    const response = await fetch('/api/accessibility/disable', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('[DataSource] ✅ 辅助服务已禁用:', data);
+                        dataSourceLabel.textContent = 'UIAutomator';
+                    } else {
+                        const errorText = await response.text();
+                        console.error('[DataSource] ⚠️ 禁用辅助服务失败:', errorText);
+                        // 禁用失败不影响使用，因为后端会回退到UIAutomator
+                        dataSourceLabel.textContent = 'UIAutomator';
+                    }
+                } catch (error) {
+                    console.error('[DataSource] ⚠️ 禁用辅助服务异常:', error);
+                    // 禁用失败不影响使用
+                    dataSourceLabel.textContent = 'UIAutomator';
+                }
+            }
+            
+            // 如果已连接设备，刷新hierarchy以使用新的数据源
+            if (rootNode) {
+                console.log('[DataSource] 重新获取UI层级...');
+                refreshHierarchy();
+            }
+        });
+    }
 };
 
 // Toast notification helpers
@@ -716,12 +809,37 @@ async function connectDevice() {
 }
 
 async function refreshSnapshot(forceShowLoading = true) {
-    if (forceShowLoading) loading.classList.remove('hidden');
+    // 给刷新按钮添加视觉反馈和马里奥金币动画
+    const refreshBtn = document.querySelector('.btn-secondary');
+    if (refreshBtn) {
+        refreshBtn.classList.add('refreshing');
+        refreshBtn.textContent = '? 刷新中...';
+        
+        // 创建金币弹出动画
+        const coin = document.createElement('div');
+        coin.className = 'coin-animation';
+        coin.textContent = '🪙';
+        refreshBtn.style.position = 'relative';
+        refreshBtn.appendChild(coin);
+        
+        // 1.2秒后移除金币元素（与CSS动画时长一致）
+        setTimeout(() => {
+            if (coin.parentNode) {
+                coin.remove();
+            }
+        }, 1200);
+    }
+    
+    // 不显示loading蒙层，只用马里奥金币特效
     try {
         // Parallel refresh
         await Promise.all([refreshScreen(), refreshHierarchy()]);
     } finally {
-        if (forceShowLoading) loading.classList.add('hidden');
+        // 恢复刷新按钮状态
+        if (refreshBtn) {
+            refreshBtn.classList.remove('refreshing');
+            refreshBtn.textContent = '📸 刷新';
+        }
     }
 }
 
@@ -736,9 +854,10 @@ function refreshScreen() {
                 if (img.decode) await img.decode();
                 screenImage = img;
 
-                const hqScale = 2;
-                canvas.width = screenImage.naturalWidth * hqScale;
-                canvas.height = screenImage.naturalHeight * hqScale;
+                // Canvas内部尺寸直接使用设备分辨率，不需要2x缩放
+                // 这样hierarchy的bounds坐标就能直接对应到Canvas坐标
+                canvas.width = screenImage.naturalWidth;
+                canvas.height = screenImage.naturalHeight;
 
                 ctx.imageSmoothingEnabled = true;
                 ctx.imageSmoothingQuality = 'high';
@@ -763,34 +882,91 @@ function toggleSidebar() {
     setTimeout(drawScreen, 350);
 }
 
+// 全局变量：存储最后点击的坐标
+let lastClickX = null;
+let lastClickY = null;
+let clickCrosshairTimeout = null;
+
 function drawScreen() {
     if (!screenImage.src) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // 渲染截图 (填满整个 2x Canvas)
+    // 渲染截图 (填满整个Canvas)
     ctx.drawImage(screenImage, 0, 0, canvas.width, canvas.height);
 
-    // 绘制 UI 高亮 (需要缩放到 2x 坐标空间)
+    // 绘制 UI 高亮
+    // Canvas内部尺寸 = 设备分辨率，所以scale = 1，不需要缩放
     ctx.save();
-    ctx.scale(2, 2);
 
     // Draw Hover
     if (hoverNode && hoverNode !== selectedNode) {
-        drawHighlight(hoverNode, '#3b82f6', 'rgba(59, 130, 246, 0.1)');
+        drawHighlight(hoverNode, '#3b82f6', 'rgba(59, 130, 246, 0.1)', 1);
     }
 
     // Draw Selected
     if (selectedNode) {
-        drawHighlight(selectedNode, '#ef4444', 'rgba(239, 68, 68, 0.2)');
+        drawHighlight(selectedNode, '#ef4444', 'rgba(239, 68, 68, 0.2)', 1);
+    }
+
+    // 绘制点击位置的红色十字准星
+    if (lastClickX !== null && lastClickY !== null) {
+        drawClickCrosshair(lastClickX, lastClickY);
     }
 
     ctx.restore();
 }
 
+// 绘制点击位置的红色十字准星（仅准星，不显示坐标文字）
+function drawClickCrosshair(deviceX, deviceY) {
+    const crosshairSize = 40;  // 十字准星大小
+    const lineWidth = 2;
+    const color = '#ff0000';  // 红色
+    
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.setLineDash([5, 5]);  // 虚线效果
+    
+    // 绘制垂直线
+    ctx.beginPath();
+    ctx.moveTo(deviceX, deviceY - crosshairSize);
+    ctx.lineTo(deviceX, deviceY + crosshairSize);
+    ctx.stroke();
+    
+    // 绘制水平线
+    ctx.beginPath();
+    ctx.moveTo(deviceX - crosshairSize, deviceY);
+    ctx.lineTo(deviceX + crosshairSize, deviceY);
+    ctx.stroke();
+    
+    // 绘制中心点
+    ctx.setLineDash([]);  // 实线
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(deviceX, deviceY, 3, 0, 2 * Math.PI);
+    ctx.fill();
+    
+    ctx.restore();
+}
+
+// 更新标题栏坐标显示
+function updateCoordDisplay(x, y) {
+    const coordDisplay = document.getElementById('coordDisplay');
+    const coordValue = document.getElementById('coordValue');
+    
+    if (x !== null && y !== null) {
+        coordValue.textContent = `(${Math.round(x)}, ${Math.round(y)})`;
+        coordDisplay.classList.remove('hidden');
+    } else {
+        coordDisplay.classList.add('hidden');
+    }
+}
+
 async function refreshHierarchy() {
     try {
         const displayId = currentDisplay || "0";
-        const res = await fetch(`/api/hierarchy?display=${displayId}`);
+        const useAccessibility = document.getElementById('useAccessibilityService').checked;
+        const res = await fetch(`/api/hierarchy?display=${displayId}&force_accessibility=${useAccessibility}`);
         if (!res.ok) return;
         const data = await res.json();
         const parser = new DOMParser();
@@ -803,6 +979,44 @@ async function refreshHierarchy() {
         const treeList = document.createElement('div');
         traverseAndBuildTree(rootNode, treeList);
         treeContainer.appendChild(treeList);
+
+        // 显示数据源信息
+        if (data.source) {
+            const sourceText = data.source === 'accessibility' ? '辅助服务' : 'UIAutomator';
+            const reason = data.reason || '';
+            let sourceMsg = `📊 数据源: ${sourceText}`;
+            
+            if (reason === 'uiautomator_incomplete') {
+                sourceMsg += ' (UIAutomator数据不完整，自动切换)';
+            } else if (reason === 'uiautomator_failed') {
+                sourceMsg += ' (UIAutomator失败，使用辅助服务)';
+            }
+            
+            console.log(`[Hierarchy] ${sourceMsg}`);
+            
+            // 更新状态显示
+            const statusEl = document.getElementById('status');
+            if (statusEl) {
+                const currentText = statusEl.innerText;
+                // 如果是连接状态，添加数据源信息
+                if (currentText.startsWith('已连接:')) {
+                    statusEl.innerText = currentText.split('[')[0].trim() + ` [${sourceText}]`;
+                }
+            }
+            
+            // 如果连接弹窗显示中，添加数据源信息到日志
+            const toast = document.getElementById('connectionToast');
+            if (toast && toast.classList.contains('show')) {
+                const logType = data.source === 'accessibility' ? 'warning' : 'info';
+                addLogEntry(sourceMsg, logType);
+                
+                // 如果使用了辅助服务，添加提示
+                if (data.source === 'accessibility') {
+                    addLogEntry('⚠️ 注意：辅助服务可能与设备原有服务冲突', 'warning');
+                    addLogEntry('💡 提示：点击"重启服务"按钮可恢复原有服务', 'info');
+                }
+            }
+        }
 
         // Restore selection if possible (by text or id?) - skipping for simplicity
 
@@ -865,11 +1079,16 @@ function traverseAndBuildTree(xmlNode, parentElement) {
         label += ` "${txt.length > 20 ? txt.substring(0, 20) + '...' : txt}"`;
     }
 
+    // NOTE: merged hierarchy root is <hierarchy>, its children are <node>. Use children length, not node-only.
     const children = Array.from(xmlNode.children).filter(c => c.tagName === 'node');
 
     // Toggle Icon
     const toggle = document.createElement('span');
     toggle.className = 'toggle-btn';
+
+    // If node itself has children, enable toggle.
+    // For the root <hierarchy>, it will also have children, but its tagName is 'hierarchy' not 'node'.
+    const isRootHierarchy = xmlNode.tagName === 'hierarchy';
 
     if (children.length > 0) {
         toggle.innerText = '+';
@@ -949,7 +1168,11 @@ function traverseAndBuildTree(xmlNode, parentElement) {
     if (children.length > 0) {
         const childContainer = document.createElement('div');
         childContainer.className = 'children-container';
-        childContainer.style.display = 'none'; // Default Hidden
+        // Root <hierarchy> 默认展开，避免用户以为“卡住了”
+        childContainer.style.display = isRootHierarchy ? 'block' : 'none';
+        if (isRootHierarchy) {
+            toggle.innerText = '-';
+        }
         children.forEach(child => traverseAndBuildTree(child, childContainer));
         container.appendChild(childContainer);
     }
@@ -1130,18 +1353,24 @@ function highlightTextWithColor(text, pattern, foreColor, ignoreCase) {
     });
 }
 
-function drawHighlight(xmlNode, strokeColor = '#ef4444', fillColor = 'rgba(239, 68, 68, 0.2)') {
+function drawHighlight(xmlNode, strokeColor = '#ef4444', fillColor = 'rgba(239, 68, 68, 0.2)', scale = 1) {
     const attrs = getAttributes(xmlNode);
     if (!attrs['bounds']) return;
     const b = parseBounds(attrs['bounds']);
     if (!b) return;
 
+    // Canvas内部尺寸 = 设备分辨率，bounds坐标直接对应Canvas坐标
+    const x = b.x * scale;
+    const y = b.y * scale;
+    const w = b.w * scale;
+    const h = b.h * scale;
+
     ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    ctx.lineWidth = 2 * scale;
+    ctx.strokeRect(x, y, w, h);
 
     ctx.fillStyle = fillColor;
-    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillRect(x, y, w, h);
 }
 
 // Interaction Variables
@@ -1154,15 +1383,23 @@ let dragStartTime = 0;
 function getCanvasCoords(e) {
     const rect = canvas.getBoundingClientRect();
 
-    // 关键修正：点击坐标必须映射回物理设备的原始分辨率 (1x)，而不是 Canvas 的 2x 采样分辨率
+    // 点击位置相对于Canvas显示区域的坐标
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+
+    // 坐标映射：点击坐标直接映射到设备物理坐标
+    // deviceCoord = clickCoord × (deviceResolution / displaySize)
     const scaleX = screenImage.naturalWidth / rect.width;
     const scaleY = screenImage.naturalHeight / rect.height;
 
+    const deviceX = clickX * scaleX;
+    const deviceY = clickY * scaleY;
+
     return {
-        x: (e.clientX - rect.left) * scaleX,
-        y: (e.clientY - rect.top) * scaleY,
-        rawX: (e.clientX - rect.left) * scaleX,
-        rawY: (e.clientY - rect.top) * scaleY
+        x: deviceX,
+        y: deviceY,
+        rawX: deviceX,
+        rawY: deviceY
     };
 }
 
@@ -1242,6 +1479,29 @@ canvas.onmouseleave = () => {
 canvas.onclick = null; // Remove old onclick handler in favor of mouseup logic
 
 function handleClick(x, y, isRealControl) {
+    // 显示点击位置的十字准星
+    lastClickX = x;
+    lastClickY = y;
+    
+    // 更新标题栏坐标显示
+    updateCoordDisplay(x, y);
+    
+    // 清除之前的定时器
+    if (clickCrosshairTimeout) {
+        clearTimeout(clickCrosshairTimeout);
+    }
+    
+    // 3秒后隐藏十字准星和坐标显示
+    clickCrosshairTimeout = setTimeout(() => {
+        lastClickX = null;
+        lastClickY = null;
+        updateCoordDisplay(null, null);
+        drawScreen();
+    }, 3000);
+    
+    // 立即重绘显示十字准星
+    drawScreen();
+    
     // 1. Real Control Logic
     if (isRealControl) {
         performRealClick(x, y);
@@ -1251,6 +1511,8 @@ function handleClick(x, y, isRealControl) {
     if (rootNode) {
         const allHits = findAllNodesAt(rootNode, x, y);
         console.log(`[HandleClick] 点击坐标 (${x}, ${y}), 找到 ${allHits.length} 个匹配节点`);
+        console.log(`[HandleClick] 设备截图分辨率: ${screenImage.naturalWidth}x${screenImage.naturalHeight}`);
+        console.log(`[HandleClick] Canvas显示尺寸: ${canvas.getBoundingClientRect().width}x${canvas.getBoundingClientRect().height}`);
         
         // 打印所有匹配节点的信息
         allHits.forEach((node, index) => {
@@ -1258,7 +1520,8 @@ function handleClick(x, y, isRealControl) {
             const bounds = attrs['bounds'];
             const className = attrs['class'] || 'unknown';
             const resourceId = attrs['resource-id'] || '';
-            console.log(`  [${index}] ${className} ${resourceId} bounds=${bounds}`);
+            const text = attrs['text'] || '';
+            console.log(`  [${index}] ${className} ${resourceId} bounds=${bounds} text="${text.substring(0, 20)}"`);
         });
         
         const bestNode = pickBestNode(allHits);
@@ -1267,7 +1530,16 @@ function handleClick(x, y, isRealControl) {
             console.log(`[HandleClick] 选中最佳节点: ${attrs['class'] || 'unknown'} bounds=${attrs['bounds']}`);
             selectNode(bestNode);
         } else {
-            console.log(`[HandleClick] 未找到匹配节点`);
+            console.log(`[HandleClick] ❌ 未找到匹配节点 - 可能的原因：`);
+            console.log(`  1. 该位置没有UI元素`);
+            console.log(`  2. 坐标映射错误`);
+            console.log(`  3. hierarchy数据与截图不同步`);
+            
+            // 如果没找到节点，打印根节点的bounds供调试
+            if (rootNode) {
+                const rootAttrs = getAttributes(rootNode.querySelector('node') || rootNode);
+                console.log(`  根节点bounds: ${rootAttrs['bounds']}`);
+            }
         }
     }
 }
@@ -1399,6 +1671,117 @@ async function autoRefreshTick() {
 
 // Start the loop
 autoRefreshTick();
+
+// 监听实时控制开关，开启时自动启用自动刷新
+document.addEventListener('DOMContentLoaded', function() {
+    const realControlCheckbox = document.getElementById('realControl');
+    const autoRefreshCheckbox = document.getElementById('autoRefresh');
+    
+    if (realControlCheckbox && autoRefreshCheckbox) {
+        realControlCheckbox.addEventListener('change', function() {
+            if (this.checked) {
+                // 开启实时控制时，自动开启自动刷新
+                console.log('[RealControl] 实时控制已开启，自动启用自动刷新');
+                autoRefreshCheckbox.checked = true;
+            }
+        });
+    }
+});
+
+// 重启服务器函数
+async function restartServer() {
+    const btn = document.querySelector('.btn-restart');
+    if (!btn) return;
+    
+    if (!confirm('⚠️ 确定要重启Python服务器吗？\n\n服务器将在几秒钟内自动重启。\n（AS插件会自动监控并重启服务）')) {
+        return;
+    }
+    
+    // 禁用按钮
+    btn.disabled = true;
+    btn.textContent = '🔄 重启中...';
+    
+    try {
+        console.log('[RestartServer] 发送重启请求...');
+        const response = await fetch('/api/restart-server', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            console.log('[RestartServer] 服务器正在重启:', data);
+            
+            // 显示等待消息
+            const statusEl = document.getElementById('status');
+            if (statusEl) {
+                statusEl.innerText = '服务器重启中...';
+                statusEl.style.color = '#f59e0b';
+            }
+            
+            // 开始轮询检查服务器是否恢复
+            let checkAttempts = 0;
+            const maxAttempts = 20; // 最多等待20秒
+            
+            const checkServer = async () => {
+                checkAttempts++;
+                console.log(`[RestartServer] 检查服务器状态... (${checkAttempts}/${maxAttempts})`);
+                
+                try {
+                    const testResponse = await fetch('/api/devices', {
+                        method: 'GET',
+                        cache: 'no-cache'
+                    });
+                    
+                    if (testResponse.ok) {
+                        console.log('[RestartServer] ✅ 服务器已恢复！');
+                        if (statusEl) {
+                            statusEl.innerText = '服务器已重启';
+                            statusEl.style.color = '#10b981';
+                        }
+                        btn.disabled = false;
+                        btn.textContent = '🔄 重启服务';
+                        
+                        // 显示成功消息并刷新页面
+                        setTimeout(() => {
+                            alert('✅ 服务器重启成功！页面将自动刷新。');
+                            window.location.reload();
+                        }, 500);
+                        return;
+                    }
+                } catch (e) {
+                    // 服务器还没恢复，继续等待
+                }
+                
+                if (checkAttempts < maxAttempts) {
+                    // 继续检查
+                    setTimeout(checkServer, 1000);
+                } else {
+                    // 超时
+                    console.error('[RestartServer] ❌ 重启超时');
+                    if (statusEl) {
+                        statusEl.innerText = '重启超时，请手动刷新页面';
+                        statusEl.style.color = '#ef4444';
+                    }
+                    btn.disabled = false;
+                    btn.textContent = '🔄 重启服务';
+                    alert('⚠️ 服务器重启超时。\n\n请尝试手动刷新页面（F5）或重新打开工具窗口。');
+                }
+            };
+            
+            // 等待2秒后开始检查（给服务器时间停止和重启）
+            setTimeout(checkServer, 2000);
+            
+        } else {
+            throw new Error('重启请求失败');
+        }
+    } catch (e) {
+        console.error('[RestartServer] 重启失败:', e);
+        alert(`❌ 重启失败: ${e.message}\n\n请手动重启服务器或重新打开工具窗口。`);
+        btn.disabled = false;
+        btn.textContent = '🔄 重启服务';
+    }
+}
 
 // Resizable Panels Logic
 const splitter = document.getElementById('sidebarSplitter');

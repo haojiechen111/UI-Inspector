@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CarUI Accessibility</string>
+    <string name="accessibility_service_description">CarUI Inspector辅助服务，用于获取UI层级信息</string>
+    <string name="service_not_enabled">请先启用辅助服务</string>
+    <string name="service_enabled">辅助服务已启用</string>
+    <string name="open_settings">打开设置</string>
+    <string name="server_status">HTTP服务器状态: %1$s</string>
+    <string name="server_running">运行中 (端口: %1$d)</string>
+    <string name="server_stopped">已停止</string>
+</resources>
