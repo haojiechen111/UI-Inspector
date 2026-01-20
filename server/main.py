@@ -68,6 +68,9 @@ else:
 current_serial: Optional[str] = None
 display_mapping: Dict[str, str] = {}
 display_info_cache: List[Dict] = []
+# SS4设备映射表：记住localhost:5559对应的原始SS4设备类型和原始序列号
+# key: "localhost:5559", value: {"type": "SS4", "original_serial": "da157e15a1f"}
+ss4_localhost_mapping: Dict[str, Dict[str, str]] = {}
 
 def refresh_display_mapping(serial: str):
     global display_mapping, display_info_cache
@@ -175,17 +178,41 @@ def detect_ss_device(serial: str) -> Optional[str]:
 
 @app.get("/api/devices")
 def get_devices():
+    global ss4_localhost_mapping
     try:
         devices = []
         for d in adb.device_list():
             model = d.prop.get("ro.product.model", "Unknown")
-            ss_type = detect_ss_device(d.serial)
+            
+            # 检查该设备是否已经被初始化为localhost:5559
+            # 如果该serial作为original_serial存在于映射表中，说明已被初始化，跳过
+            is_already_initialized = False
+            for localhost_serial, mapping_info in ss4_localhost_mapping.items():
+                if mapping_info.get("original_serial") == d.serial:
+                    is_already_initialized = True
+                    print(f"[GET_DEVICES] 🚫 跳过已初始化设备 {d.serial} (已转换为 {localhost_serial})")
+                    break
+            
+            # 如果设备已被初始化，不显示在列表中
+            if is_already_initialized:
+                continue
+            
+            # 特殊处理：如果是localhost:5559，检查映射表
+            if d.serial == "localhost:5559" and d.serial in ss4_localhost_mapping:
+                ss_type = ss4_localhost_mapping[d.serial]["type"]  # 从字典中提取type
+                print(f"[GET_DEVICES] 从映射表识别 {d.serial} 为 {ss_type}")
+            else:
+                ss_type = detect_ss_device(d.serial)
+            
+            # 判断是否需要初始化
+            # 如果是SS4设备且不是localhost:5559，说明需要初始化
+            needs_init = (ss_type == "SS4") and (d.serial != "localhost:5559")
             
             device_info = {
                 "serial": d.serial,
                 "model": model,
                 "ss_type": ss_type,  # Will be "SS4", "SS3", etc. or None
-                "needs_init": ss_type == "SS4"  # Only SS4 needs init, not SS2/SS3
+                "needs_init": needs_init  # SS4设备且未初始化时为True
             }
             devices.append(device_info)
         return devices
@@ -203,6 +230,7 @@ class SS4InitRequest(BaseModel):
 @app.post("/api/init-ss4")
 def init_ss4_device(req: SS4InitRequest):
     """Initialize SS4 device with required ADB commands"""
+    global ss4_localhost_mapping
     try:
         serial = req.serial
         print(f"Initializing SS4 device: {serial}")
@@ -254,6 +282,13 @@ def init_ss4_device(req: SS4InitRequest):
         
         time.sleep(1)
         
+        # 记录映射关系：localhost:5559 -> {type: SS4, original_serial: xxx}
+        ss4_localhost_mapping["localhost:5559"] = {
+            "type": "SS4",
+            "original_serial": serial  # 保存原始物理设备序列号
+        }
+        print(f"[INIT_SS4] ✅ 已记录映射: localhost:5559 -> SS4 (原始序列号: {serial})")
+        
         return {
             "status": "success",
             "message": "SS4 device initialized successfully",
@@ -265,16 +300,26 @@ def init_ss4_device(req: SS4InitRequest):
 
 @app.get("/api/displays")
 def get_displays(serial: Optional[str] = None):
-    global current_serial, display_info_cache
+    global current_serial, display_info_cache, ss4_localhost_mapping
     target_serial = serial or current_serial
     
     if not target_serial:
         return []
     
-    # Detect device type for logging
-    ss_type = detect_ss_device(target_serial)
+    # 检测设备类型：优先从映射表获取（针对localhost:5559这类转换后的SS4设备）
+    # 然后尝试直接检测设备类型
+    ss_type = None
+    if target_serial == "localhost:5559" and target_serial in ss4_localhost_mapping:
+        ss_type = ss4_localhost_mapping[target_serial]["type"]  # 从字典中提取type
+        print(f"[DISPLAYS] 从映射表识别 {target_serial} 为 {ss_type}")
+    else:
+        # 直接检测设备类型（适用于未初始化的SS4设备）
+        ss_type = detect_ss_device(target_serial)
+        print(f"[DISPLAYS] 通过getprop检测设备类型: {ss_type}")
+    
     print(f"[DISPLAYS] Device type: {ss_type}")
     print(f"[DISPLAYS] Device serial: {target_serial}")
+    print(f"[DISPLAYS] 开始动态探测设备的display配置...")
     
     # 尝试动态获取设备实际支持的display列表
     res = refresh_display_mapping(target_serial)
@@ -332,14 +377,18 @@ def connect_device(req: ConnectRequest):
     try:
         if req.serial:
             current_serial = req.serial
+            print(f"[CONNECT] 设置 current_serial 为: {current_serial}")
         else:
             devices = adb.device_list()
             if not devices:
                 raise HTTPException(status_code=404, detail="No devices found")
             current_serial = devices[0].serial
+            print(f"[CONNECT] 自动选择第一个设备: {current_serial}")
         
         d = adb.device(serial=current_serial)
         model = d.prop.get("ro.product.model", "Unknown")
+        
+        print(f"[CONNECT] ✅ 连接成功: {current_serial}, Model: {model}")
         
         return {
             "status": "connected", 
@@ -351,6 +400,7 @@ def connect_device(req: ConnectRequest):
             }
         }
     except Exception as e:
+        print(f"[CONNECT] ❌ 连接失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/screenshot")
@@ -416,7 +466,12 @@ def get_screenshot(display: str = "0"):
         for cmd_str in cmd_variations:
             try:
                 print(f"[SCREENSHOT] 🔧 尝试命令: {cmd_str}")
-                res = d.shell(cmd_str, decode=False)
+                # 注意：不同版本的adbutils对shell()的返回值处理不同
+                # 新版本返回bytes，旧版本可能返回str
+                res = d.shell(cmd_str)
+                # 如果返回的是字符串，转换为bytes
+                if isinstance(res, str):
+                    res = res.encode('latin1')
                 if res and len(res) > 100:
                     print(f"[SCREENSHOT] ✅ 成功！截图大小: {len(res)} bytes")
                     raw_png = res
@@ -1063,16 +1118,23 @@ def back_button(req: BackRequest):
 @app.post("/api/accessibility/enable")
 def enable_accessibility_service():
     """启用辅助服务"""
-    global current_serial
+    global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
     
+    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
+    target_serial = current_serial
+    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
+        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
+        print(f"[Accessibility] 🔧 SS4设备，使用原始序列号操作: {target_serial} (而非 {current_serial})")
+    
     try:
         print(f"[Accessibility] 🔧 启用辅助服务...")
+        print(f"[Accessibility] 📱 目标设备: {target_serial}")
         
         # 获取当前启用的所有辅助服务
         result = subprocess.run(
-            ["adb", "-s", current_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -1094,23 +1156,23 @@ def enable_accessibility_service():
         else:
             new_services = "com.carui.accessibility/.CarUIAccessibilityService"
         
-        # 更新设置
+        # 更新设置（使用target_serial）
         subprocess.run(
-            ["adb", "-s", current_serial, "shell", "settings", "put", "secure", 
+            ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
              "enabled_accessibility_services", new_services],
             capture_output=True, text=True, timeout=3
         )
         
         # 确保辅助服务功能已启用
         subprocess.run(
-            ["adb", "-s", current_serial, "shell", "settings", "put", "secure",
+            ["adb", "-s", target_serial, "shell", "settings", "put", "secure",
              "accessibility_enabled", "1"],
             capture_output=True, text=True, timeout=3
         )
         
-        # 设置端口转发
+        # 设置端口转发（使用target_serial）
         subprocess.run(
-            ["adb", "-s", current_serial, "forward", "tcp:8765", "tcp:8765"],
+            ["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -1131,16 +1193,23 @@ def enable_accessibility_service():
 @app.post("/api/accessibility/disable")
 def disable_accessibility_service():
     """禁用辅助服务，恢复原有服务（如语音服务）"""
-    global current_serial
+    global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
     
+    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
+    target_serial = current_serial
+    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
+        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
+        print(f"[Accessibility] 🛑 SS4设备，使用原始序列号操作: {target_serial} (而非 {current_serial})")
+    
     try:
         print(f"[Accessibility] 🛑 禁用辅助服务...")
+        print(f"[Accessibility] 📱 目标设备: {target_serial}")
         
         # 获取当前启用的所有辅助服务
         result = subprocess.run(
-            ["adb", "-s", current_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -1155,9 +1224,9 @@ def disable_accessibility_service():
             
             new_services = ':'.join(services_list)
             
-            # 更新设置
+            # 更新设置（使用target_serial）
             subprocess.run(
-                ["adb", "-s", current_serial, "shell", "settings", "put", "secure", 
+                ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
                  "enabled_accessibility_services", new_services],
                 capture_output=True, text=True, timeout=3
             )
@@ -1185,22 +1254,31 @@ def disable_accessibility_service():
 @app.get("/api/accessibility/status")
 def get_accessibility_status():
     """获取辅助服务状态"""
-    global current_serial
+    global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
     
+    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
+    target_serial = current_serial
+    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
+        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
+        print(f"[Accessibility] 📊 SS4设备，使用原始序列号查询状态: {target_serial} (而非 {current_serial})")
+    
     try:
+        print(f"[Accessibility] 📊 查询辅助服务状态...")
+        print(f"[Accessibility] 📱 目标设备: {target_serial}")
+        
         # 检查是否启用
         result = subprocess.run(
-            ["adb", "-s", current_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
             capture_output=True, text=True, timeout=3
         )
         
         enabled_services = result.stdout.strip()
         is_enabled = "com.carui.accessibility" in enabled_services
         
-        # 检查是否运行中
-        is_running = check_accessibility_service(current_serial)
+        # 检查是否运行中（使用target_serial）
+        is_running = check_accessibility_service(target_serial)
         
         return {
             "enabled": is_enabled,

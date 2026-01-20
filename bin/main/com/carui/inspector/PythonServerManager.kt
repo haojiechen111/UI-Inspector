@@ -58,7 +58,7 @@ object PythonServerManager {
     fun checkDependencies(pluginPath: String): DependencyCheckResult {
         serverDir = File(pluginPath, "server")
         val checkScript = File(serverDir, "check_dependencies.py")
-        
+
         if (!checkScript.exists()) {
             LOG.warn("Dependency check script not found, skipping check")
             return DependencyCheckResult(
@@ -77,41 +77,49 @@ object PythonServerManager {
             )
         }
 
-        // 尝试python3
-        var pythonCmd = "python3"
+        // 尝试多个可能的Python路径
+        val pythonCandidates = listOf(
+            "/opt/homebrew/bin/python3.9",  // Homebrew Python 3.9 (Apple Silicon)
+            "/opt/homebrew/bin/python3",     // Homebrew Python 3 (Apple Silicon)
+            "/usr/local/bin/python3.9",      // Homebrew Python 3.9 (Intel)
+            "/usr/local/bin/python3",        // Homebrew Python 3 (Intel)
+            "python3",                       // System Python 3
+            "python"                         // Fallback to python
+        )
+
+        var pythonCmd: String? = null
         var process: Process? = null
-        
-        try {
-            val pb = ProcessBuilder(pythonCmd, checkScript.absolutePath)
-            pb.directory(serverDir)
-            pb.redirectErrorStream(true)
-            process = pb.start()
-        } catch (e: Exception) {
-            LOG.info("python3 not found, trying python: ${e.message}")
-            // 尝试python
+
+        for (candidate in pythonCandidates) {
             try {
-                pythonCmd = "python"
-                val pb = ProcessBuilder(pythonCmd, checkScript.absolutePath)
+                val pb = ProcessBuilder(candidate, checkScript.absolutePath)
                 pb.directory(serverDir)
                 pb.redirectErrorStream(true)
                 process = pb.start()
-            } catch (e2: Exception) {
-                LOG.error("Both python3 and python not found: ${e2.message}")
-                return DependencyCheckResult(
-                    success = false,
-                    pythonVersion = null,
-                    pythonVersionFromCmd = null,
-                    pythonOk = false,
-                    missingPackages = emptyList(),
-                    missingPackagesWithCmd = emptyMap(),
-                    errorMessage = "未找到Python命令。请确保已安装Python 3.7+并添加到系统PATH。",
-                    osType = null,
-                    osName = null,
-                    pipCmd = null,
-                    pipMethods = emptyList(),
-                    sysPath = emptyList()
-                )
+                pythonCmd = candidate
+                LOG.info("Found working Python: $candidate")
+                break
+            } catch (e: Exception) {
+                LOG.info("$candidate not available: ${e.message}")
             }
+        }
+
+        if (process == null || pythonCmd == null) {
+            LOG.error("No working Python found")
+            return DependencyCheckResult(
+                success = false,
+                pythonVersion = null,
+                pythonVersionFromCmd = null,
+                pythonOk = false,
+                missingPackages = emptyList(),
+                missingPackagesWithCmd = emptyMap(),
+                errorMessage = "未找到Python命令。请确保已安装Python 3.7+并添加到系统PATH。",
+                osType = null,
+                osName = null,
+                pipCmd = null,
+                pipMethods = emptyList(),
+                sysPath = emptyList()
+            )
         }
 
         // 读取检查结果
@@ -120,33 +128,33 @@ object PythonServerManager {
                 val reader = BufferedReader(InputStreamReader(p.inputStream))
                 val output = reader.readText()
                 p.waitFor()
-                
+
                 LOG.info("Dependency check output: $output")
-                
+
                 // 手动解析JSON结果
                 try {
                     // 简单的JSON解析
                     val allOk = output.contains("\"all_ok\": true")
                     val pythonOk = output.contains("\"python_ok\": true")
-                    
+
                     // 提取Python版本（使用完整版本号）
                     val pythonVersion = Regex("\"python_version\":\\s*\"([^\"]+)\"")
                         .find(output)?.groupValues?.get(1) ?: "unknown"
-                    
+
                     // 提取使用 python --version 获取的版本
                     val pythonVersionFromCmd = Regex("\"python_version_from_cmd\":\\s*\"([^\"]+)\"")
                         .find(output)?.groupValues?.get(1)
-                    
+
                     // 提取OS信息
                     val osType = Regex("\"os_type\":\\s*\"([^\"]+)\"")
                         .find(output)?.groupValues?.get(1)
                     val osName = Regex("\"os_name\":\\s*\"([^\"]+)\"")
                         .find(output)?.groupValues?.get(1)
-                    
+
                     // 提取 pip 命令信息
                     val pipCmd = Regex("\"pip_cmd\":\\s*\"([^\"]+)\"")
                         .find(output)?.groupValues?.get(1)
-                    
+
                     // 提取所有可用的 pip 方法
                     val pipMethods = mutableListOf<String>()
                     val pipMethodsPattern = Regex("\"pip_methods\":\\s*\\[([^\\]]+)\\]")
@@ -157,7 +165,7 @@ object PythonServerManager {
                             pipMethods.add(match.groupValues[1])
                         }
                     }
-                    
+
                     // 提取 sys.path（用于诊断）
                     val sysPath = mutableListOf<String>()
                     val sysPathPattern = Regex("\"sys_path\":\\s*\\[([^\\]]+)\\]")
@@ -168,26 +176,26 @@ object PythonServerManager {
                             sysPath.add(match.groupValues[1])
                         }
                     }
-                    
+
                     // 提取缺失的包及其安装命令
                     val missingPackages = mutableListOf<String>()
                     val missingPackagesWithCmd = mutableMapOf<String, String>()
-                    
+
                     // 找到 dependencies 块
                     val depsBlockPattern = Regex("\"dependencies\":\\s*\\{([^}]+(?:\\{[^}]*\\}[^}]*)*)\\}")
                     val depsBlockMatch = depsBlockPattern.find(output)
                     if (depsBlockMatch != null) {
                         val depsBlock = depsBlockMatch.groupValues[1]
-                        
+
                         // 对于每个依赖包，检查是否已安装
                         val packagePattern = Regex("\"(\\w+)\":\\s*\\{([^}]+)\\}")
                         packagePattern.findAll(depsBlock).forEach { match ->
                             val packageName = match.groupValues[1]
                             val packageInfo = match.groupValues[2]
-                            
+
                             if (packageInfo.contains("\"installed\":\\s*false".toRegex())) {
                                 missingPackages.add(packageName)
-                                
+
                                 // 提取该包的安装命令
                                 val installCmdPattern = Regex("\"install_cmd\":\\s*\"([^\"]+)\"")
                                 val installCmd = installCmdPattern.find(packageInfo)?.groupValues?.get(1)
@@ -197,14 +205,14 @@ object PythonServerManager {
                             }
                         }
                     }
-                    
+
                     // 优先使用从 Python 脚本检测到的 pip 命令，否则根据OS类型生成
                     val pipCommand = pipCmd ?: when (osType) {
                         "Windows" -> "pip"
                         "Darwin" -> "pip3"  // macOS
                         else -> "pip3"  // Linux/Ubuntu
                     }
-                    
+
                     val errorMsg = if (!allOk) {
                         buildString {
                             if (!pythonOk) {
@@ -212,7 +220,7 @@ object PythonServerManager {
                             }
                             if (missingPackages.isNotEmpty()) {
                                 append("缺少依赖包：${missingPackages.joinToString(", ")}\n\n")
-                                
+
                                 // 根据不同系统提供不同的安装指引
                                 when (osType) {
                                     "Windows" -> {
@@ -249,7 +257,7 @@ object PythonServerManager {
                             }
                         }
                     } else null
-                    
+
                     val result = DependencyCheckResult(
                         success = allOk,
                         pythonVersion = pythonVersion,
@@ -266,7 +274,7 @@ object PythonServerManager {
                     )
                     lastCheckResult = result
                     return result
-                    
+
                 } catch (e: Exception) {
                     LOG.error("Failed to parse dependency check result: ${e.message}")
                     return DependencyCheckResult(
@@ -302,7 +310,7 @@ object PythonServerManager {
                 )
             }
         }
-        
+
         return DependencyCheckResult(
             success = false,
             pythonVersion = null,
@@ -318,15 +326,18 @@ object PythonServerManager {
             sysPath = emptyList()
         )
     }
-
     fun getLastCheckResult(): DependencyCheckResult? = lastCheckResult
 
-    fun start(pluginPath: String): String? {
+    fun start(pluginPath: String, enableMonitoring: Boolean = true): String? {
+        pluginPathCache = pluginPath
         serverDir = File(pluginPath, "server")
         val mainScript = File(serverDir, "main.py")
-        
+
         if (isServerRunning()) {
             LOG.info("Car UI Server is already running on ${getServerURL()}")
+            if (enableMonitoring && !shouldMonitor) {
+                startMonitoring()
+            }
             return null
         }
 
@@ -339,31 +350,39 @@ object PythonServerManager {
         val logFile = File(serverDir, "server_log.txt")
         LOG.info("Starting Car UI Server. Logs at: ${logFile.absolutePath}")
 
-        val pb = ProcessBuilder("python3", "main.py")
-        pb.directory(serverDir)
-        pb.redirectErrorStream(true)
-        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
-        
-        try {
-            process = pb.start()
-            return null
-        } catch (e: Exception) {
-            LOG.error("Failed to start with 'python3', trying 'python': ${e.message}")
+        // 尝试多个可能的Python路径
+        val pythonCandidates = listOf(
+            "/opt/homebrew/bin/python3.9",  // Homebrew Python 3.9 (Apple Silicon)
+            "/opt/homebrew/bin/python3",     // Homebrew Python 3 (Apple Silicon)
+            "/usr/local/bin/python3.9",      // Homebrew Python 3.9 (Intel)
+            "/usr/local/bin/python3",        // Homebrew Python 3 (Intel)
+            "python3",                       // System Python 3
+            "python"                         // Fallback to python
+        )
+
+        var lastError: String? = null
+        for (pythonCmd in pythonCandidates) {
             try {
-               val pb2 = ProcessBuilder("python", "main.py")
-               pb2.directory(serverDir)
-               pb2.redirectErrorStream(true)
-               pb2.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
-               process = pb2.start()
-               return null
-            } catch (e2: Exception) {
-               val error = "Python启动失败：${e2.message}"
-               LOG.error(error)
-               return error
+                val pb = ProcessBuilder(pythonCmd, "main.py")
+                pb.directory(serverDir)
+                pb.redirectErrorStream(true)
+                pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+                process = pb.start()
+                LOG.info("Server process started successfully with '$pythonCmd'")
+                if (enableMonitoring) {
+                    startMonitoring()
+                }
+                return null
+            } catch (e: Exception) {
+                lastError = e.message
+                LOG.info("Failed to start with '$pythonCmd': ${e.message}")
             }
         }
-    }
 
+        val error = "Python启动失败。已尝试所有可能的Python路径。最后错误：$lastError"
+        LOG.error(error)
+        return error
+    }
     fun getServerLog(): String {
         serverDir?.let { dir ->
             val logFile = File(dir, "server_log.txt")

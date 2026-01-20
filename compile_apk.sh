@@ -49,16 +49,18 @@ fi
 echo "📦 项目路径: $(pwd)"
 echo ""
 
-# 检查是否有gradle
-if command -v gradle &> /dev/null; then
-    echo "✅ 使用系统gradle"
-    GRADLE_CMD="gradle"
-elif [ -f "../gradlew" ]; then
+# 检查是否有gradle，优先使用项目的gradlew
+if [ -f "../gradlew" ]; then
     echo "✅ 使用项目gradlew"
     GRADLE_CMD="../gradlew"
+    chmod +x ../gradlew
 elif [ -f "gradlew" ]; then
     echo "✅ 使用当前目录gradlew"
     GRADLE_CMD="./gradlew"
+    chmod +x ./gradlew
+elif command -v gradle &> /dev/null; then
+    echo "⚠️  使用系统gradle（可能版本较旧）"
+    GRADLE_CMD="gradle"
 else
     echo "⚠️ 未找到gradle命令，尝试使用Android Studio..."
     echo ""
@@ -82,7 +84,7 @@ echo "🔨 开始编译..."
 $GRADLE_CMD assembleDebug
 
 if [ $? -eq 0 ]; then
-    APK_PATH="build/outputs/apk/debug/accessibility_service-debug.apk"
+    APK_PATH="build/outputs/apk/debug/CarUIAccessibilityService-debug.apk"
     if [ -f "$APK_PATH" ]; then
         APK_SIZE=$(du -h "$APK_PATH" | cut -f1)
         echo ""

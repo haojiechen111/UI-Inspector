@@ -325,20 +325,111 @@ function updateDeviceModalList() {
         text.innerHTML = `<strong>${d.model}</strong><br><small style="color: #6b7280">${d.serial}${ssLabel}</small>`;
         item.appendChild(text);
         
-        if (d.ss_type) {
+        // 检查是否是未连接的SS4设备
+        const isUnconnectedSS4 = d.ss_type === 'SS4' && d.serial !== 'localhost:5559';
+        
+        if (isUnconnectedSS4) {
+            // 未连接标识
+            const unconnectedBadge = document.createElement('span');
+            unconnectedBadge.className = 'modal-item-badge';
+            unconnectedBadge.style.backgroundColor = '#ef4444';
+            unconnectedBadge.innerText = '未连接';
+            unconnectedBadge.title = '需要执行初始化连接';
+            item.appendChild(unconnectedBadge);
+            
+            // 连接按钮
+            const connectBtn = document.createElement('button');
+            connectBtn.className = 'btn-connect';
+            connectBtn.innerText = '连接';
+            connectBtn.title = '初始化SS4设备连接';
+            connectBtn.onclick = async (e) => {
+                e.stopPropagation(); // 阻止触发设备选择
+                await initSS4Device(d);
+            };
+            item.appendChild(connectBtn);
+        } else if (d.ss_type) {
+            // 已连接的SS设备显示类型badge
             const badge = document.createElement('span');
             badge.className = 'modal-item-badge';
             badge.innerText = d.ss_type;
             item.appendChild(badge);
         }
         
-        item.onclick = () => {
-            selectDevice(d);
-            closeDeviceModal();
-        };
+        // 只有非未连接SS4设备才能直接点击选择
+        if (!isUnconnectedSS4) {
+            item.onclick = () => {
+                selectDevice(d);
+                closeDeviceModal();
+            };
+        } else {
+            // 未连接SS4设备点击时提示需要先连接
+            item.onclick = () => {
+                alert('⚠️ 此SS4设备尚未连接\n\n请点击"连接"按钮进行初始化连接');
+            };
+            item.style.cursor = 'default';
+        }
         
         listContainer.appendChild(item);
     });
+}
+
+// SS4设备初始化函数
+async function initSS4Device(device) {
+    const serial = device.serial;
+    console.log(`[InitSS4Device] 开始初始化SS4设备: ${serial}`);
+    
+    // 显示连接日志Toast
+    clearLog();
+    showToast();
+    addLogEntry(`🚀 开始初始化SS4设备: ${serial}`, 'info');
+    
+    try {
+        addLogEntry(`📝 步骤1: 执行 adb root`, 'info');
+        addLogEntry(`📝 步骤2: 执行 adb shell adbconnect.sh`, 'info');
+        addLogEntry(`📝 步骤3: 执行 adb forward tcp:5559 tcp:5557`, 'info');
+        addLogEntry(`📝 步骤4: 执行 adb connect localhost:5559`, 'info');
+        addLogEntry(`📝 步骤5: 执行 adb -s localhost:5559 root`, 'info');
+        
+        const response = await fetch('/api/init-ss4', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serial: serial })
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`[InitSS4Device] 初始化失败: ${errorText}`);
+            addLogEntry(`❌ SS4初始化失败: ${errorText}`, 'error');
+            alert(`❌ SS4设备初始化失败:\n\n${errorText}`);
+            return;
+        }
+        
+        const data = await response.json();
+        console.log(`[InitSS4Device] 初始化成功:`, data);
+        addLogEntry(`✅ SS4初始化成功！`, 'success');
+        addLogEntry(`🔄 新设备地址: ${data.new_serial}`, 'success');
+        
+        // 等待连接稳定
+        addLogEntry(`⏳ 等待连接稳定...`, 'info');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // 刷新设备列表
+        addLogEntry(`🔄 刷新设备列表...`, 'info');
+        await refreshDeviceList(false);
+        
+        // 更新设备选择弹窗
+        updateDeviceModalList();
+        
+        addLogEntry(`🎉 SS4设备已就绪，请选择设备并连接`, 'success');
+        
+        // 显示成功提示
+        alert(`✅ SS4设备初始化成功！\n\n新设备地址: ${data.new_serial}\n\n请选择该设备并点击"连接设备"按钮`);
+        
+    } catch (e) {
+        console.error(`[InitSS4Device] 初始化异常:`, e);
+        addLogEntry(`❌ 初始化异常: ${e.message}`, 'error');
+        alert(`❌ SS4设备初始化失败:\n\n${e.message}`);
+    }
 }
 
 function updateDisplayModalList() {
@@ -388,6 +479,9 @@ function selectDevice(device) {
         btn.style.transform = 'scale(1)';
     }, 100);
     
+    // 启用display选择器
+    enableDisplaySelector();
+    
     onDeviceChanged();
 }
 
@@ -406,100 +500,76 @@ function selectDisplay(displayId, description) {
     console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description, "- 需要点击'连接设备'按钮才会连接");
 }
 
+// 启用/禁用display选择器
+function enableDisplaySelector() {
+    const displayBtn = document.getElementById('displaySelectBtn');
+    const displayRefreshBtn = displayBtn.nextElementSibling; // 刷新按钮
+    
+    if (displayBtn) {
+        displayBtn.disabled = false;
+        displayBtn.style.opacity = '1';
+        displayBtn.style.cursor = 'pointer';
+        displayBtn.title = '选择显示屏幕';
+    }
+    
+    if (displayRefreshBtn) {
+        displayRefreshBtn.disabled = false;
+        displayRefreshBtn.style.opacity = '1';
+        displayRefreshBtn.style.cursor = 'pointer';
+    }
+    
+    console.log('[DisplaySelector] ✅ Display选择器已启用');
+}
+
+function disableDisplaySelector() {
+    const displayBtn = document.getElementById('displaySelectBtn');
+    const displayText = document.getElementById('displaySelectText');
+    const displayRefreshBtn = displayBtn.nextElementSibling; // 刷新按钮
+    
+    if (displayBtn) {
+        displayBtn.disabled = true;
+        displayBtn.style.opacity = '0.5';
+        displayBtn.style.cursor = 'not-allowed';
+        displayBtn.title = '请先选择设备';
+    }
+    
+    if (displayText) {
+        displayText.innerText = '请先选择设备';
+    }
+    
+    if (displayRefreshBtn) {
+        displayRefreshBtn.disabled = true;
+        displayRefreshBtn.style.opacity = '0.5';
+        displayRefreshBtn.style.cursor = 'not-allowed';
+    }
+    
+    console.log('[DisplaySelector] 🔒 Display选择器已禁用');
+}
+
 // Init
 window.onload = () => {
     loadSettings(); // Load settings from localStorage
+    disableDisplaySelector(); // 初始化时禁用display选择器
     refreshDeviceList(); // 只加载设备列表，不自动连接
     
-    // 监听数据源开关变化
+    // 监听数据源开关变化 - 只更新标签，不立即启用/禁用服务
     const dataSourceSwitch = document.getElementById('useAccessibilityService');
     const dataSourceLabel = document.getElementById('dataSourceLabel');
     
     if (dataSourceSwitch && dataSourceLabel) {
-        dataSourceSwitch.addEventListener('change', async function() {
+        dataSourceSwitch.addEventListener('change', function() {
             if (this.checked) {
-                // 切换到辅助服务模式 - 需要启用辅助服务
-                dataSourceLabel.textContent = '辅助服务 (启用中...)';
-                console.log('[DataSource] 切换到辅助服务模式，正在启用...');
-                
-                try {
-                    const response = await fetch('/api/accessibility/enable', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                    
-                    if (response.ok) {
-                        const data = await response.json();
-                        console.log('[DataSource] ✅ 辅助服务已启用:', data);
-                        dataSourceLabel.textContent = '辅助服务';
-                        
-                        // 显示提示
-                        if (data.already_enabled) {
-                            console.log('[DataSource] 辅助服务已经处于启用状态');
-                        } else {
-                            console.log('[DataSource] 辅助服务启用成功');
-                            // 可以选择显示一个提示
-                            const statusEl = document.getElementById('status');
-                            if (statusEl) {
-                                const originalText = statusEl.innerText;
-                                statusEl.innerText = '✅ 辅助服务已启用';
-                                statusEl.style.color = '#10b981';
-                                setTimeout(() => {
-                                    statusEl.innerText = originalText;
-                                    statusEl.style.color = '#10b981';
-                                }, 2000);
-                            }
-                        }
-                    } else {
-                        const errorText = await response.text();
-                        console.error('[DataSource] ❌ 启用辅助服务失败:', errorText);
-                        dataSourceLabel.textContent = '辅助服务 (启用失败)';
-                        alert(`启用辅助服务失败: ${errorText}\n\n请检查：\n1. 设备是否已连接\n2. 是否已安装辅助服务APK`);
-                        // 恢复开关状态
-                        this.checked = false;
-                        dataSourceLabel.textContent = 'UIAutomator';
-                        return;
-                    }
-                } catch (error) {
-                    console.error('[DataSource] ❌ 启用辅助服务异常:', error);
-                    dataSourceLabel.textContent = '辅助服务 (启用失败)';
-                    alert(`启用辅助服务失败: ${error.message}`);
-                    // 恢复开关状态
-                    this.checked = false;
-                    dataSourceLabel.textContent = 'UIAutomator';
-                    return;
-                }
+                dataSourceLabel.textContent = '辅助服务';
+                console.log('[DataSource] 已选择辅助服务模式（将在连接设备时生效）');
             } else {
-                // 切换到UIAutomator模式 - 禁用辅助服务
-                dataSourceLabel.textContent = 'UIAutomator (禁用中...)';
-                console.log('[DataSource] 切换到UIAutomator模式，正在禁用辅助服务...');
-                
-                try {
-                    const response = await fetch('/api/accessibility/disable', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                    
-                    if (response.ok) {
-                        const data = await response.json();
-                        console.log('[DataSource] ✅ 辅助服务已禁用:', data);
-                        dataSourceLabel.textContent = 'UIAutomator';
-                    } else {
-                        const errorText = await response.text();
-                        console.error('[DataSource] ⚠️ 禁用辅助服务失败:', errorText);
-                        // 禁用失败不影响使用，因为后端会回退到UIAutomator
-                        dataSourceLabel.textContent = 'UIAutomator';
-                    }
-                } catch (error) {
-                    console.error('[DataSource] ⚠️ 禁用辅助服务异常:', error);
-                    // 禁用失败不影响使用
-                    dataSourceLabel.textContent = 'UIAutomator';
-                }
+                dataSourceLabel.textContent = 'UIAutomator';
+                console.log('[DataSource] 已选择UIAutomator模式');
             }
             
-            // 如果已连接设备，刷新hierarchy以使用新的数据源
+            // 如果已连接设备，提示需要重新连接才能生效
             if (rootNode) {
-                console.log('[DataSource] 重新获取UI层级...');
+                console.log('[DataSource] ⚠️ 数据源已更改，刷新后将使用新的数据源');
+                // 刷新hierarchy以使用新的数据源
                 refreshHierarchy();
             }
         });
@@ -579,15 +649,19 @@ async function refreshDeviceList(autoConnect = false) {
             return;
         }
 
-        // 只选择第一个设备作为默认选择，不自动连接
-        if (devicesList.length > 0 && !currentDevice) {
+        // 如果只有一个设备，自动选择；如果有多个设备，不自动选择
+        if (devicesList.length === 1 && !currentDevice) {
             currentDevice = devicesList[0];
             const displayName = currentDevice.ss_type || currentDevice.model;
             btn.innerText = displayName;
-            console.log("[RefreshDeviceList] 默认选择第一个设备:", currentDevice.serial);
+            console.log("[RefreshDeviceList] 只有一个设备，自动选择:", currentDevice.serial);
             
             // 只获取显示列表，不连接
             onDeviceChanged();
+        } else if (devicesList.length > 1 && !currentDevice) {
+            // 多个设备时，不自动选择
+            console.log("[RefreshDeviceList] 检测到多个设备，请手动选择");
+            btn.innerText = `请选择设备 (${devicesList.length}个)`;
         }
         
         // 仅在明确请求自动连接时才连接（点击刷新按钮时）
