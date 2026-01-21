@@ -16,6 +16,24 @@ let hoverNode = null; // New for hover
 let screenImage = new Image();
 let mapNodeToDom = new Map();
 
+// Accessibility status cache
+let accessibilityStatus = {
+    enabled: false,
+    running: false,
+    checkedAt: 0
+};
+
+// Header status rendering (base text + multiple tags)
+let statusBaseText = '未连接';
+const statusTags = new Map(); // key -> string (without brackets)
+
+function renderStatus() {
+    const statusEl = document.getElementById('status');
+    if (!statusEl) return;
+    const tags = Array.from(statusTags.values()).filter(Boolean).map(t => `[${t}]`).join(' ');
+    statusEl.innerText = tags ? `${statusBaseText} ${tags}` : statusBaseText;
+}
+
 // Settings state - 每个关键字都有独立的颜色配置
 let searchSettings = {
     patterns: [],  // 每个元素是 { text, foreColor, backColor }
@@ -857,12 +875,18 @@ async function connectDevice() {
         console.log("[ConnectDevice] 连接成功，设备信息:", data);
         const productName = data.info.productName || "Unknown Device";
         const statusEl = document.getElementById('status');
-        statusEl.innerText = `已连接: ${productName}`;
+        statusBaseText = `已连接: ${productName}`;
+        // reset tags on new connection
+        statusTags.clear();
+        renderStatus();
         statusEl.classList.remove('status-badge');
         statusEl.style.color = '#10b981';
         statusEl.style.fontWeight = 'bold';
         
         addLogEntry(`✅ 连接成功: ${productName}`, 'success');
+
+        // Step 4: If user selected accessibility mode, verify service status and reflect it on UI
+        await updateAccessibilityUIStatus();
         
         console.log("[ConnectDevice] 开始刷新快照...");
         addLogEntry(`📸 正在获取屏幕截图...`, 'info');
@@ -879,6 +903,57 @@ async function connectDevice() {
         alert("连接失败: " + e.message);
     } finally {
         loading.classList.add('hidden');
+    }
+}
+
+async function fetchAccessibilityStatus() {
+    try {
+        const res = await fetch('/api/accessibility/status', { cache: 'no-cache' });
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (e) {
+        console.warn('[AccessibilityStatus] fetch failed', e);
+        return null;
+    }
+}
+
+function setStatusBadgeWithExtras(extraText) {
+    // Backward compatible wrapper: treat extraText as a single tag, stored under 'extra'
+    if (extraText) {
+        statusTags.set('extra', extraText.replace(/^\[/, '').replace(/\]$/, ''));
+    } else {
+        statusTags.delete('extra');
+    }
+    renderStatus();
+}
+
+async function updateAccessibilityUIStatus() {
+    const useAccessibility = document.getElementById('useAccessibilityService')?.checked;
+    if (!useAccessibility) {
+        // not in accessibility mode
+        return;
+    }
+
+    const data = await fetchAccessibilityStatus();
+    if (!data) {
+        accessibilityStatus = { enabled: false, running: false, checkedAt: Date.now() };
+        statusTags.set('a11y', '辅助服务:未知');
+        renderStatus();
+        addLogEntry('⚠️ 辅助服务状态获取失败（请确认已安装APK并已开启服务）', 'warning');
+        return;
+    }
+
+    accessibilityStatus = { ...data, checkedAt: Date.now() };
+    const enabledText = data.enabled ? '已启用' : '未启用';
+    const runningText = data.running ? '运行中' : '未运行';
+    statusTags.set('a11y', `辅助服务:${runningText}`);
+    renderStatus();
+
+    if (!data.enabled || !data.running) {
+        addLogEntry(`⚠️ 辅助服务异常：${enabledText} / ${runningText}`, 'warning');
+        addLogEntry('💡 建议：到系统“无障碍”里打开 CarUI Accessibility；或重启服务后重连', 'info');
+    } else {
+        addLogEntry('✅ 辅助服务运行正常', 'success');
     }
 }
 
@@ -936,6 +1011,9 @@ function refreshScreen() {
                 ctx.imageSmoothingEnabled = true;
                 ctx.imageSmoothingQuality = 'high';
                 drawScreen();
+
+                // After drawing screenshot, detect black/secure-protected content
+                await updateSecureWarningByScreenshot();
                 resolve();
             } catch (err) {
                 console.warn("Decode failed", err);
@@ -988,6 +1066,107 @@ function drawScreen() {
     }
 
     ctx.restore();
+}
+
+// --- Secure/black screenshot detection & UX warning ---
+let lastScreenshotBlackRatio = null;
+let lastSecureDiagnoseAt = 0;
+let lastSecureDiagnose = null;
+
+function showSecureWarning(messageHtml) {
+    const el = document.getElementById('secureWarning');
+    if (!el) return;
+    el.innerHTML = `
+      <div class="msg">${messageHtml}</div>
+      <button class="close" onclick="document.getElementById('secureWarning').classList.add('hidden')">关闭</button>
+    `;
+    el.classList.remove('hidden');
+}
+
+function hideSecureWarning() {
+    const el = document.getElementById('secureWarning');
+    if (!el) return;
+    el.classList.add('hidden');
+}
+
+function computeBlackRatioFromCanvas(sampleStep = 20) {
+    // returns ratio of pixels that are near-black (0..1)
+    try {
+        const w = canvas.width;
+        const h = canvas.height;
+        if (!w || !h) return null;
+        const imgData = ctx.getImageData(0, 0, w, h).data;
+        let black = 0;
+        let total = 0;
+        // sample every N pixels to keep fast
+        for (let y = 0; y < h; y += sampleStep) {
+            for (let x = 0; x < w; x += sampleStep) {
+                const idx = (y * w + x) * 4;
+                const r = imgData[idx];
+                const g = imgData[idx + 1];
+                const b = imgData[idx + 2];
+                // near black threshold
+                if (r < 8 && g < 8 && b < 8) black++;
+                total++;
+            }
+        }
+        if (total === 0) return null;
+        return black / total;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function diagnoseSecureIfNeeded() {
+    const now = Date.now();
+    if (now - lastSecureDiagnoseAt < 5000) return lastSecureDiagnose; // throttle
+    lastSecureDiagnoseAt = now;
+    try {
+        const res = await fetch('/api/diagnose/secure', { cache: 'no-cache' });
+        if (!res.ok) return null;
+        lastSecureDiagnose = await res.json();
+        return lastSecureDiagnose;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function updateSecureWarningByScreenshot() {
+    // Decide based on black ratio.
+    // Note: some UIs have large black background, so we only warn when ratio is extremely high.
+    const ratio = computeBlackRatioFromCanvas(25);
+    if (ratio == null) return;
+    lastScreenshotBlackRatio = ratio;
+
+    // If it's mostly black, we further diagnose.
+    if (ratio >= 0.985) {
+        const diag = await diagnoseSecureIfNeeded();
+        if (diag && diag.has_secure_layer) {
+            const top = (diag.resumed_activities || []).slice(-1)[0] || '';
+            const layer = (diag.secure_layers || [])[0]?.layer || '';
+            showSecureWarning(
+                `⚠️ 检测到当前页面/窗口可能<strong>禁止截屏</strong>（SurfaceFlinger: <code>isSecure=true</code>）。` +
+                `<br/>因此截图区域会显示为黑/空白，但辅助服务仍可抓取节点。` +
+                (top ? `<br/><small>前台: ${top}</small>` : '') +
+                (layer ? `<br/><small>Secure Layer: ${layer}</small>` : '')
+            );
+            // Also tag in status area
+            statusTags.set('capture', '截图受限');
+            renderStatus();
+        } else {
+            // unknown black screen
+            showSecureWarning('⚠️ 截图几乎全黑：可能是抓错 display、或该页面走了 Overlay/受保护渲染。');
+            statusTags.set('capture', '截图异常');
+            renderStatus();
+        }
+    } else {
+        // looks fine
+        hideSecureWarning();
+        if (statusTags.has('capture')) {
+            statusTags.delete('capture');
+            renderStatus();
+        }
+    }
 }
 
 // 绘制点击位置的红色十字准星（仅准星，不显示坐标文字）
@@ -1068,15 +1247,9 @@ async function refreshHierarchy() {
             
             console.log(`[Hierarchy] ${sourceMsg}`);
             
-            // 更新状态显示
-            const statusEl = document.getElementById('status');
-            if (statusEl) {
-                const currentText = statusEl.innerText;
-                // 如果是连接状态，添加数据源信息
-                if (currentText.startsWith('已连接:')) {
-                    statusEl.innerText = currentText.split('[')[0].trim() + ` [${sourceText}]`;
-                }
-            }
+            // 更新右上角状态：数据源 tag
+            statusTags.set('source', sourceText);
+            renderStatus();
             
             // 如果连接弹窗显示中，添加数据源信息到日志
             const toast = document.getElementById('connectionToast');
@@ -1090,6 +1263,11 @@ async function refreshHierarchy() {
                     addLogEntry('💡 提示：点击"重启服务"按钮可恢复原有服务', 'info');
                 }
             }
+        }
+
+        // 若当前选择辅助服务模式，顺便刷新一下辅助服务状态（避免只显示数据源不显示运行状态）
+        if (document.getElementById('useAccessibilityService')?.checked) {
+            await updateAccessibilityUIStatus();
         }
 
         // Restore selection if possible (by text or id?) - skipping for simplicity

@@ -68,9 +68,101 @@ else:
 current_serial: Optional[str] = None
 display_mapping: Dict[str, str] = {}
 display_info_cache: List[Dict] = []
+# hierarchy cache: key=display id, value=last successful xml
+hierarchy_xml_cache: Dict[int, str] = {}
 # SS4设备映射表：记住localhost:5559对应的原始SS4设备类型和原始序列号
 # key: "localhost:5559", value: {"type": "SS4", "original_serial": "da157e15a1f"}
 ss4_localhost_mapping: Dict[str, Dict[str, str]] = {}
+
+
+def resolve_accessibility_target_serial(serial: str) -> str:
+    """辅助服务相关操作需要在“物理设备”上执行。
+
+    对于 SS4 这类会被转换成 localhost:5559 的设备：
+    - current_serial 用于截图/输入事件
+    - 辅助服务 APK 仍运行在原始物理 serial 上
+    """
+    global ss4_localhost_mapping
+    if serial == "localhost:5559" and serial in ss4_localhost_mapping:
+        return ss4_localhost_mapping[serial].get("original_serial", serial)
+    return serial
+
+
+def _adb_shell(serial: str, cmd: str, timeout: int = 5) -> str:
+    """Run adb shell command and return stdout (best-effort)."""
+    try:
+        res = subprocess.run(
+            ["adb", "-s", serial, "shell", cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return (res.stdout or "")
+    except Exception:
+        return ""
+
+
+def diagnose_secure_layers(serial: str) -> Dict:
+    """Diagnose whether current UI is protected from screenshot.
+
+    We mainly rely on SurfaceFlinger layer flags (isSecure=true / hasProtectedContent=true).
+    This is more reliable than FLAG_SECURE in dumpsys window on some OEM builds.
+    """
+    result: Dict = {
+        "serial": serial,
+        "resumed_activities": [],
+        "secure_layers": [],
+        "has_secure_layer": False,
+    }
+
+    # 1) top/resumed activities
+    try:
+        act_out = _adb_shell(serial, "dumpsys activity activities", timeout=5)
+        # keep a few lines only
+        resumed = []
+        for line in act_out.splitlines():
+            if "mResumedActivity" in line:
+                resumed.append(line.strip())
+        result["resumed_activities"] = resumed[-3:]
+    except Exception:
+        pass
+
+    # 2) SurfaceFlinger secure layer markers
+    try:
+        sf_out = _adb_shell(serial, "dumpsys SurfaceFlinger", timeout=6)
+        layers = []
+        # Find blocks like:
+        # * Layer 0x... (pkg/Activity#0)
+        #   isSecure=true ...
+        current_name = None
+        for line in sf_out.splitlines():
+            if line.startswith("* Layer"):
+                # Example: * Layer 0x... (xxx)
+                m = re.search(r"\(([^)]+)\)", line)
+                current_name = m.group(1) if m else line.strip()
+                continue
+            if "isSecure=true" in line or "hasProtectedContent=true" in line:
+                if current_name:
+                    layers.append({
+                        "layer": current_name,
+                        "flag_line": line.strip(),
+                    })
+        result["secure_layers"] = layers[:20]
+        result["has_secure_layer"] = len(layers) > 0
+    except Exception:
+        pass
+
+    return result
+
+
+@app.get("/api/diagnose/secure")
+def api_diagnose_secure():
+    """Diagnose if current screen is protected from screenshot."""
+    global current_serial
+    if not current_serial:
+        raise HTTPException(status_code=400, detail="Device not connected")
+    return diagnose_secure_layers(current_serial)
 
 def refresh_display_mapping(serial: str):
     global display_mapping, display_info_cache
@@ -560,6 +652,14 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
         
         print(f"[Accessibility] 📡 从辅助服务获取UI树...")
         
+        # 确保端口转发（某些设备/系统在状态检测后仍可能失效，兜底再 forward 一次）
+        subprocess.run(
+            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+
         # 请求UI树
         response = requests.get(f"http://localhost:8765/api/hierarchy?display={display}", timeout=5)
         if response.status_code != 200:
@@ -574,6 +674,55 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
         nodes = data.get("nodes", [])
         print(f"[Accessibility] ✅ 获取到 {len(nodes)} 个根节点")
         
+        # --- 坐标归一化：将“全局坐标”转换为“当前 display 截图坐标系” ---
+        # 在多屏/分屏场景下，AccessibilityNodeInfo#getBoundsInScreen 可能返回带 display 偏移的坐标，
+        # 而 screencap -d <display> 的截图坐标原点是 (0,0)。
+        # 这里用该 display 的窗口 bounds 的最小 left/top 作为 display 的原点偏移，并对疑似“绝对坐标”的节点做减偏移。
+        origin_x = 0
+        origin_y = 0
+        try:
+            xs = []
+            ys = []
+            for rn in nodes:
+                wb = ((rn.get("window") or {}).get("bounds") or {})
+                if "left" in wb and "top" in wb:
+                    xs.append(int(wb.get("left", 0)))
+                    ys.append(int(wb.get("top", 0)))
+            if xs and ys:
+                origin_x = min(xs)
+                origin_y = min(ys)
+        except Exception:
+            origin_x = 0
+            origin_y = 0
+
+        def normalize_bounds(b: Dict) -> Dict:
+            """按需将 bounds 从全局坐标转换为 display 内坐标。"""
+            if not b:
+                return b
+            try:
+                l = int(b.get("left", 0))
+                t = int(b.get("top", 0))
+                r = int(b.get("right", 0))
+                bt = int(b.get("bottom", 0))
+
+                # 如果 origin 很接近 0，说明已是 display 坐标系
+                if origin_x < 50 and origin_y < 50:
+                    return {"left": l, "top": t, "right": r, "bottom": bt}
+
+                margin = 200
+                # 只有当节点坐标看起来“落在 origin 偏移之后”，才做减偏移
+                if l >= origin_x - margin and t >= origin_y - margin and r > origin_x and bt > origin_y:
+                    nl = max(0, l - origin_x)
+                    nt = max(0, t - origin_y)
+                    nr = max(0, r - origin_x)
+                    nb = max(0, bt - origin_y)
+                    return {"left": nl, "top": nt, "right": nr, "bottom": nb}
+
+                # 否则保持原值（一般是 already-relative）
+                return {"left": l, "top": t, "right": r, "bottom": bt}
+            except Exception:
+                return b
+
         # 转换为XML格式
         hierarchy = ET.Element('hierarchy')
         hierarchy.set('rotation', '0')
@@ -590,7 +739,7 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
             node.set('resource-id', json_node.get('resourceId', ''))
             
             # 坐标
-            bounds = json_node.get('bounds', {})
+            bounds = normalize_bounds(json_node.get('bounds', {}))
             bounds_str = f"[{bounds.get('left',0)},{bounds.get('top',0)}][{bounds.get('right',0)},{bounds.get('bottom',0)}]"
             node.set('bounds', bounds_str)
             
@@ -598,6 +747,9 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
             node.set('clickable', str(json_node.get('clickable', False)).lower())
             node.set('long-clickable', str(json_node.get('longClickable', False)).lower())
             node.set('enabled', str(json_node.get('enabled', True)).lower())
+            # Accessibility 专有：是否对用户可见
+            if 'visibleToUser' in json_node:
+                node.set('visible-to-user', str(json_node.get('visibleToUser', False)).lower())
             node.set('focusable', str(json_node.get('focusable', False)).lower())
             node.set('focused', str(json_node.get('focused', False)).lower())
             node.set('selected', str(json_node.get('selected', False)).lower())
@@ -629,6 +781,7 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
 @app.get("/api/hierarchy")
 def get_hierarchy(display: int = 0, force_accessibility: bool = False):
     global current_serial
+    global hierarchy_xml_cache
     if not current_serial:
          raise HTTPException(status_code=400, detail="Device not connected")
     
@@ -639,8 +792,12 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
     if force_accessibility:
         # 用户选择使用辅助服务
         print(f"[Hierarchy] 🔧 使用辅助服务模式")
-        if check_accessibility_service(current_serial):
-            xml_from_accessibility = get_hierarchy_from_accessibility(current_serial, display)
+        target_serial = resolve_accessibility_target_serial(current_serial)
+        if target_serial != current_serial:
+            print(f"[Hierarchy] ♿ 辅助服务目标设备序列号修正: {current_serial} -> {target_serial}")
+
+        if check_accessibility_service(target_serial):
+            xml_from_accessibility = get_hierarchy_from_accessibility(target_serial, display)
             if xml_from_accessibility:
                 print(f"[Hierarchy] ✅ 使用辅助服务数据源")
                 return {"xml": xml_from_accessibility, "source": "accessibility"}
@@ -663,21 +820,41 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
         d.shell(f"rm -f {dump_path}")
         
         # 获取所有display的完整hierarchy（使用--windows获取多窗口多display数据）
+        # 某些车机上 uiautomator dump 会偶发报：ERROR: could not get idle state.
+        # 这里做重试，并优先使用 --compressed 降低数据量。
         print(f"[Hierarchy] 🔍 获取所有display的完整层级数据...")
-        cmd = f"uiautomator dump --windows {dump_path}"
-        err = d.shell(cmd)
-        print(f"[Hierarchy] uiautomator dump输出: {err}")
-        
-        # 读取dump的内容
-        xml_content = d.shell(f"cat {dump_path}")
+        dump_err = ""
+        for attempt in range(3):
+            try:
+                cmd = f"uiautomator dump --compressed --windows {dump_path}"
+                dump_err = d.shell(cmd)
+                print(f"[Hierarchy] uiautomator dump输出(attempt {attempt+1}/3): {dump_err}")
+                xml_content = d.shell(f"cat {dump_path}")
+                if xml_content and "<?xml" in xml_content:
+                    break
+            except Exception as _e:
+                dump_err = str(_e)
+            import time
+            time.sleep(0.3)
+
+        # 读取dump的内容（若上面已经读取并成功，会走到这里继续使用）
+        if 'xml_content' not in locals():
+            xml_content = d.shell(f"cat {dump_path}")
         
         if not xml_content or "<?xml" not in xml_content:
             print(f"[Hierarchy] --windows方式失败,尝试指定display...")
             # Fallback: 尝试指定display
             d.shell(f"rm -f {dump_path}")
-            cmd = f"uiautomator dump --display {display} {dump_path}"
-            err = d.shell(cmd)
-            xml_content = d.shell(f"cat {dump_path}")
+            # 也做一次重试
+            for attempt in range(3):
+                cmd = f"uiautomator dump --compressed --display {display} {dump_path}"
+                err = d.shell(cmd)
+                print(f"[Hierarchy] uiautomator dump(display)输出(attempt {attempt+1}/3): {err}")
+                xml_content = d.shell(f"cat {dump_path}")
+                if xml_content and "<?xml" in xml_content:
+                    break
+                import time
+                time.sleep(0.3)
             
         if not xml_content or "<?xml" not in xml_content:
             raise Exception(f"Failed to dump hierarchy for display {display}")
@@ -1039,6 +1216,8 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
         # 成功获取到XML
         uiautomator_xml = xml_content
         print(f"[Hierarchy] ✅ UIAutomator数据获取成功")
+        # cache
+        hierarchy_xml_cache[display] = uiautomator_xml
         return {"xml": uiautomator_xml, "source": "uiautomator"}
         
     except Exception as e:
@@ -1046,8 +1225,25 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
         import traceback
         traceback.print_exc()
         
-        # UIAutomator失败，抛出异常
-        raise HTTPException(status_code=500, detail=f"Failed to get hierarchy from UIAutomator: {str(e)}")
+        # UIAutomator失败：尽量返回缓存，避免前端完全不可用
+        cached = hierarchy_xml_cache.get(display)
+        if cached:
+            print(f"[Hierarchy] 🧰 返回缓存的hierarchy(避免前端中断)，display={display}")
+            return {
+                "xml": cached,
+                "source": "cache",
+                "reason": "uiautomator_failed",
+                "error": str(e),
+            }
+
+        # 无缓存则返回一个空的 hierarchy，仍然 200，前端可提示但不至于崩
+        empty_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><hierarchy rotation=\"0\"/>"
+        return {
+            "xml": empty_xml,
+            "source": "empty",
+            "reason": "uiautomator_failed",
+            "error": str(e),
+        }
 
 class ClickRequest(BaseModel):
     x: int

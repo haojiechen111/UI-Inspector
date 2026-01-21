@@ -1736,3 +1736,37 @@ input:checked+.slider::before {
     opacity: 0.6;
     transform: none;
 }
+
+/* Secure/black screenshot warning bar */
+.secure-warning {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    top: 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(245, 158, 11, 0.18);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    color: #fbbf24;
+    font-size: 12px;
+    line-height: 1.35;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    z-index: 20;
+}
+
+.secure-warning .msg {
+    flex: 1;
+}
+
+.secure-warning .close {
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.12);
+    color: #fbbf24;
+    font-weight: 600;
+}
