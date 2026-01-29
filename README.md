@@ -204,6 +204,62 @@ curl http://localhost:8765/api/status
 
 📖 **详细文档：** 查看 [`accessibility_service/README.md`](accessibility_service/README.md)
 
+---
+
+## SS4 设备上“辅助服务:未运行”的排查与修复建议
+
+你看到的状态一般来自 Web UI 调用 `GET /api/accessibility/status`：
+
+- **enabled**：通过 `adb shell settings get secure enabled_accessibility_services` 判断（部分 SS4/车机系统可能不支持该命令）
+- **running**：通过 `adb forward tcp:8765 tcp:8765` + 访问 `http://localhost:8765/api/status` 判断（服务端口由无障碍服务内置 HTTP 提供）
+
+### 1) 典型原因（SS4 特别常见）
+
+SS4 初始化后你会使用 `localhost:5559` 作为截图/输入的 serial，但“辅助服务 APK 实际运行”的 serial 可能是：
+
+- `localhost:5559`（多数环境）
+- 或者初始化前的 **原始物理 serial**（少数环境）
+
+如果后台错误地只对其中一个 serial 做 `settings/forward/probe`，就会出现：
+
+> 已连接正常，但一直显示「辅助服务:未运行」
+
+本仓库已在 `server/main.py` 中修复：
+
+- `/api/accessibility/enable|disable|status` 统一使用更稳健的 serial 选择逻辑
+- `/api/accessibility/status` 会返回 `shell_serial / target_serial / probe.candidates` 等信息帮助定位
+
+### 2) 直接诊断命令（建议你在电脑上执行）
+
+假设你当前连接是 `localhost:5559`，但也请把 `<ORIG_SERIAL>` 换成你的原始 serial 都跑一遍：
+
+```bash
+# A) 看无障碍服务是否在 enabled 列表里（如果 settings 命令可用）
+adb -s localhost:5559 shell settings get secure enabled_accessibility_services
+
+# B) 看我们的 APK 是否安装
+adb -s localhost:5559 shell pm path com.carui.accessibility
+
+# C) 看服务日志（只抓我们 TAG）
+adb -s localhost:5559 logcat -s CarUIAccessibility
+
+# D) 如果你怀疑服务跑在原始 serial 上：
+adb -s <ORIG_SERIAL> shell settings get secure enabled_accessibility_services
+adb -s <ORIG_SERIAL> shell pm path com.carui.accessibility
+adb -s <ORIG_SERIAL> logcat -s CarUIAccessibility
+```
+
+### 3) 如果 settings 页面打不开/无法手动启用
+
+辅助服务 APK 内的 `CarUI Accessibility` App 有 “一键启用（ROOT）” 按钮，会尝试通过 `su` 写入 secure settings。
+
+如果设备有 root，也可以用 ADB 兜底（会覆盖 enabled_accessibility_services，请你先读取原值再追加）：
+
+```bash
+adb -s <SERIAL> shell settings put secure enabled_accessibility_services "<原值>:com.carui.accessibility/.CarUIAccessibilityService"
+adb -s <SERIAL> shell settings put secure accessibility_enabled 1
+```
+
 ## Manual Server Testing
 If you want to test the server independently:
 ```bash

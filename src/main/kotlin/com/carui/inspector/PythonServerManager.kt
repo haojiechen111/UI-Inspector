@@ -32,6 +32,33 @@ object PythonServerManager {
     private var shouldMonitor = false
     private var pluginPathCache: String? = null
 
+    private const val RESTART_FLAG_FILE = "restart_requested.flag"
+
+    private fun getRestartFlagFile(): File? {
+        val dir = serverDir ?: return null
+        return File(dir, RESTART_FLAG_FILE)
+    }
+
+    /**
+     * Python 端收到 /api/restart-server 后会落盘该标记文件，用于让插件侧快速感知“这次退出是主动重启”。
+     */
+    private fun isRestartRequestedFlagPresent(): Boolean {
+        return try {
+            val f = getRestartFlagFile() ?: return false
+            f.exists() && f.length() > 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun clearRestartRequestedFlag() {
+        try {
+            val f = getRestartFlagFile() ?: return
+            if (f.exists()) f.delete()
+        } catch (_: Exception) {
+        }
+    }
+
     fun getServerPort(): Int {
         // Try to read port from file
         serverDir?.let { dir ->
@@ -395,25 +422,38 @@ object PythonServerManager {
             
             while (shouldMonitor) {
                 try {
-                    Thread.sleep(5000) // 每5秒检查一次
+                    Thread.sleep(1000) // 每1秒检查一次（提高重启响应速度）
                     
                     if (!shouldMonitor) break
                     
+                    // 允许通过“重启标记文件”快速触发重启（避免 5s*3 的长等待）
+                    val restartFlag = isRestartRequestedFlagPresent()
+
                     // 检查进程是否存活
                     val processAlive = process?.isAlive ?: false
                     val serverResponding = isServerRunning()
                     
-                    if (!processAlive || !serverResponding) {
-                        consecutiveFailures++
-                        LOG.warn("Server not responding (attempt $consecutiveFailures/$maxConsecutiveFailures)")
+                    if (!processAlive || !serverResponding || restartFlag) {
+                        if (restartFlag) {
+                            LOG.warn("Restart flag detected, triggering immediate restart")
+                        } else {
+                            consecutiveFailures++
+                            LOG.warn("Server not responding (attempt $consecutiveFailures/$maxConsecutiveFailures)")
+                        }
+
+                        // 触发条件：有 restart flag 或达到失败阈值
+                        val shouldRestartNow = restartFlag || consecutiveFailures >= maxConsecutiveFailures
                         
-                        if (consecutiveFailures >= maxConsecutiveFailures) {
-                            LOG.error("Server failed $consecutiveFailures times, attempting restart...")
+                        if (shouldRestartNow) {
+                            LOG.error("Attempting restart... (restartFlag=$restartFlag, failures=$consecutiveFailures)")
                             
                             // 尝试重启
                             pluginPathCache?.let { path ->
+                                // 清理标记文件，避免重复触发
+                                if (restartFlag) clearRestartRequestedFlag()
+
                                 stop()
-                                Thread.sleep(2000) // 等待2秒确保端口释放
+                                Thread.sleep(800) // 等待端口释放（缩短等待）
                                 
                                 val restartError = start(path, enableMonitoring = false) // 重启时暂不启动监控，避免递归
                                 if (restartError == null) {
@@ -421,7 +461,7 @@ object PythonServerManager {
                                     consecutiveFailures = 0
                                     // 重新启动监控
                                     if (shouldMonitor) {
-                                        Thread.sleep(3000) // 等待服务器稳定
+                                        Thread.sleep(1200) // 等待服务器稳定
                                     }
                                 } else {
                                     LOG.error("Failed to restart server: $restartError")
@@ -434,6 +474,9 @@ object PythonServerManager {
                             LOG.info("Server recovered, resetting failure count")
                             consecutiveFailures = 0
                         }
+
+                        // 服务已恢复，若有残留标记文件则清理
+                        if (restartFlag) clearRestartRequestedFlag()
                     }
                 } catch (e: InterruptedException) {
                     LOG.info("Monitoring thread interrupted")
@@ -490,8 +533,71 @@ object PythonServerManager {
     }
 
     fun stop() {
-        process?.destroy()
+        try {
+            process?.destroy()
+        } catch (_: Exception) {
+        } finally {
+            process = null
+        }
+    }
+
+    /**
+     * “瞬间杀死一切”版停止：
+     * - 直接 destroyForcibly
+     * - 尽量杀掉子进程（ProcessHandle descendants）
+     * - 可选清理 server_port.txt / restart_requested.flag，让下次启动更干净
+     */
+    fun hardStop(clearPortFile: Boolean = true, clearRestartFlag: Boolean = true) {
+        stopMonitoring()
+
+        val p = process
+        if (p != null) {
+            try {
+                val handle = p.toHandle()
+                try {
+                    // Kill children first
+                    handle.descendants().forEach {
+                        try {
+                            it.destroyForcibly()
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (_: Exception) {
+                    // ignore - ProcessHandle may not be available on some JREs
+                }
+
+                try {
+                    p.destroyForcibly()
+                } catch (_: Exception) {
+                }
+
+                try {
+                    // Best-effort wait a bit to release port
+                    p.waitFor(300, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: Exception) {
+                }
+            } catch (e: Exception) {
+                LOG.warn("Hard stop failed: ${e.message}")
+            }
+        }
+
         process = null
+
+        // Clean files (best-effort)
+        try {
+            val dir = serverDir
+            if (dir != null) {
+                if (clearPortFile) {
+                    val portFile = File(dir, "server_port.txt")
+                    if (portFile.exists()) portFile.delete()
+                }
+                if (clearRestartFlag) {
+                    val f = File(dir, RESTART_FLAG_FILE)
+                    if (f.exists()) f.delete()
+                }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     fun isServerRunning(): Boolean {

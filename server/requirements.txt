@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-uiautomator2
+adbutils
 pillow
 urllib3<2.0.0
+requests
 pyinstaller

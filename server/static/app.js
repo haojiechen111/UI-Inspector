@@ -391,21 +391,73 @@ function updateDeviceModalList() {
     });
 }
 
-// SS4设备初始化函数
+// SS4设备初始化函数 - 改进版：在弹窗中显示进度
 async function initSS4Device(device) {
     const serial = device.serial;
     console.log(`[InitSS4Device] 开始初始化SS4设备: ${serial}`);
+    
+    // 找到对应的modal-item和连接按钮
+    const modalList = document.getElementById('deviceModalList');
+    const items = modalList.querySelectorAll('.modal-item');
+    let targetItem = null;
+    let connectBtn = null;
+    
+    // 找到对应设备的项
+    items.forEach(item => {
+        const textContent = item.textContent || '';
+        if (textContent.includes(serial)) {
+            targetItem = item;
+            connectBtn = item.querySelector('.btn-connect');
+        }
+    });
     
     // 显示连接日志Toast
     clearLog();
     showToast();
     addLogEntry(`🚀 开始初始化SS4设备: ${serial}`, 'info');
     
+    // 在弹窗项中显示进度状态
+    if (connectBtn) {
+        connectBtn.disabled = true;
+        connectBtn.textContent = '连接中...';
+        connectBtn.style.background = '#f59e0b';
+    }
+    
+    // 添加进度指示器到设备项
+    let progressIndicator = null;
+    if (targetItem) {
+        progressIndicator = document.createElement('div');
+        progressIndicator.className = 'init-progress';
+        progressIndicator.innerHTML = '<div class="progress-spinner"></div><span class="progress-text">正在初始化...</span>';
+        targetItem.appendChild(progressIndicator);
+        targetItem.style.pointerEvents = 'none'; // 防止点击
+    }
+    
+    const updateProgress = (text) => {
+        if (progressIndicator) {
+            const textEl = progressIndicator.querySelector('.progress-text');
+            if (textEl) textEl.textContent = text;
+        }
+    };
+    
     try {
+        updateProgress('步骤1/5: adb root');
         addLogEntry(`📝 步骤1: 执行 adb root`, 'info');
+        await new Promise(r => setTimeout(r, 200)); // 让用户看到进度
+        
+        updateProgress('步骤2/5: adbconnect.sh');
         addLogEntry(`📝 步骤2: 执行 adb shell adbconnect.sh`, 'info');
+        await new Promise(r => setTimeout(r, 200));
+        
+        updateProgress('步骤3/5: adb forward');
         addLogEntry(`📝 步骤3: 执行 adb forward tcp:5559 tcp:5557`, 'info');
+        await new Promise(r => setTimeout(r, 200));
+        
+        updateProgress('步骤4/5: adb connect');
         addLogEntry(`📝 步骤4: 执行 adb connect localhost:5559`, 'info');
+        await new Promise(r => setTimeout(r, 200));
+        
+        updateProgress('步骤5/5: 最终root');
         addLogEntry(`📝 步骤5: 执行 adb -s localhost:5559 root`, 'info');
         
         const response = await fetch('/api/init-ss4', {
@@ -418,34 +470,77 @@ async function initSS4Device(device) {
             const errorText = await response.text();
             console.error(`[InitSS4Device] 初始化失败: ${errorText}`);
             addLogEntry(`❌ SS4初始化失败: ${errorText}`, 'error');
+            
+            // 恢复按钮状态
+            if (connectBtn) {
+                connectBtn.disabled = false;
+                connectBtn.textContent = '连接';
+                connectBtn.style.background = '';
+            }
+            if (progressIndicator) progressIndicator.remove();
+            if (targetItem) targetItem.style.pointerEvents = '';
+            
             alert(`❌ SS4设备初始化失败:\n\n${errorText}`);
             return;
         }
         
         const data = await response.json();
         console.log(`[InitSS4Device] 初始化成功:`, data);
+        
+        updateProgress('✅ 初始化成功');
         addLogEntry(`✅ SS4初始化成功！`, 'success');
         addLogEntry(`🔄 新设备地址: ${data.new_serial}`, 'success');
         
         // 等待连接稳定
+        updateProgress('⏳ 等待连接稳定...');
         addLogEntry(`⏳ 等待连接稳定...`, 'info');
         await new Promise(resolve => setTimeout(resolve, 1000));
         
         // 刷新设备列表
+        updateProgress('🔄 刷新设备列表...');
         addLogEntry(`🔄 刷新设备列表...`, 'info');
         await refreshDeviceList(false);
         
-        // 更新设备选择弹窗
-        updateDeviceModalList();
-        
+        // 更新设备选择弹窗 - 这会重新渲染整个列表
+        updateProgress('🎉 完成！');
         addLogEntry(`🎉 SS4设备已就绪，请选择设备并连接`, 'success');
         
-        // 显示成功提示
-        alert(`✅ SS4设备初始化成功！\n\n新设备地址: ${data.new_serial}\n\n请选择该设备并点击"连接设备"按钮`);
+        // 短暂延迟后刷新弹窗显示
+        await new Promise(r => setTimeout(r, 500));
+        updateDeviceModalList();
+        
+        // 自动选中新连接的设备（localhost:5559）
+        const newDevice = devicesList.find(d => d.serial === data.new_serial);
+        if (newDevice) {
+            console.log('[InitSS4Device] 自动选中新设备:', data.new_serial);
+            selectDevice(newDevice);
+            
+            // 在弹窗中高亮显示
+            setTimeout(() => {
+                const items = document.querySelectorAll('.modal-item');
+                items.forEach(item => {
+                    if (item.textContent.includes(data.new_serial)) {
+                        item.classList.add('selected');
+                        // 添加闪烁效果提示用户
+                        item.style.animation = 'pulse 0.5s ease-in-out 3';
+                    }
+                });
+            }, 100);
+        }
         
     } catch (e) {
         console.error(`[InitSS4Device] 初始化异常:`, e);
         addLogEntry(`❌ 初始化异常: ${e.message}`, 'error');
+        
+        // 恢复按钮状态
+        if (connectBtn) {
+            connectBtn.disabled = false;
+            connectBtn.textContent = '连接';
+            connectBtn.style.background = '';
+        }
+        if (progressIndicator) progressIndicator.remove();
+        if (targetItem) targetItem.style.pointerEvents = '';
+        
         alert(`❌ SS4设备初始化失败:\n\n${e.message}`);
     }
 }
@@ -885,7 +980,39 @@ async function connectDevice() {
         
         addLogEntry(`✅ 连接成功: ${productName}`, 'success');
 
-        // Step 4: If user selected accessibility mode, verify service status and reflect it on UI
+        // Step 4: If user selected accessibility mode, do one-click ensure (install/enable/probe)
+        const useAccessibility = document.getElementById('useAccessibilityService')?.checked;
+        if (useAccessibility) {
+            addLogEntry('♿ 一键启动辅助服务（安装/启用/校验）...', 'info');
+            try {
+                const ensureRes = await fetch('/api/accessibility/ensure', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ serial: targetSerial, install_if_missing: true })
+                });
+
+                if (ensureRes.ok) {
+                    const ensureData = await ensureRes.json();
+                    // Print steps to toast
+                    if (ensureData && Array.isArray(ensureData.steps)) {
+                        ensureData.steps.forEach(s => addLogEntry(`♿ ${s}`, 'info'));
+                    }
+
+                    if (ensureData.running) {
+                        addLogEntry('✅ 辅助服务已运行并通过校验 (/api/status)', 'success');
+                    } else {
+                        addLogEntry('⚠️ 辅助服务未能自动拉起（可能需要ROOT/系统权限或手动在设置里开启）', 'warning');
+                    }
+                } else {
+                    const errText = await ensureRes.text();
+                    addLogEntry(`⚠️ 一键启动辅助服务失败: ${errText}`, 'warning');
+                }
+            } catch (e) {
+                addLogEntry(`⚠️ 一键启动辅助服务异常: ${e.message}`, 'warning');
+            }
+        }
+
+        // Step 4.5: Refresh accessibility status tag
         await updateAccessibilityUIStatus();
         
         console.log("[ConnectDevice] 开始刷新快照...");
@@ -958,6 +1085,10 @@ async function updateAccessibilityUIStatus() {
 }
 
 async function refreshSnapshot(forceShowLoading = true) {
+    // 如果之前被“关闭截屏页面/重启清理”隐藏了，这里恢复显示
+    const screenEmpty = document.getElementById('screenEmptyState');
+    if (screenEmpty) screenEmpty.classList.add('hidden');
+
     // 给刷新按钮添加视觉反馈和马里奥金币动画
     const refreshBtn = document.querySelector('.btn-secondary');
     if (refreshBtn) {
@@ -999,6 +1130,10 @@ function refreshScreen() {
         img.src = `/api/screenshot?display=${displayId}&t=${new Date().getTime()}`;
         img.onload = async () => {
             try {
+                // 截图已恢复，隐藏“截屏已关闭”遮罩
+                const screenEmpty = document.getElementById('screenEmptyState');
+                if (screenEmpty) screenEmpty.classList.add('hidden');
+
                 // 开启异步解码，避免主线程卡顿，实现 scrcpy 般的流畅感
                 if (img.decode) await img.decode();
                 screenImage = img;
@@ -1945,15 +2080,157 @@ async function restartServer() {
     const btn = document.querySelector('.btn-restart');
     if (!btn) return;
     
-    if (!confirm('⚠️ 确定要重启Python服务器吗？\n\n服务器将在几秒钟内自动重启。\n（AS插件会自动监控并重启服务）')) {
-        return;
-    }
+    // Android Studio 内嵌 JCEF 有时对 confirm/alert 的交互支持不稳定，会导致“点击没反应”。
+    // 这里改为：点击即执行，并用 overlay + status 提示。
     
     // 禁用按钮
     btn.disabled = true;
     btn.textContent = '🔄 重启中...';
+
+    // --- 1) 立刻清理UI状态（你希望的“清空现场/关闭截屏页/清空所有选择”） ---
+    const overlay = document.getElementById('restartOverlay');
+    const subtitleEl = document.getElementById('restartSubtitle');
+    const hintEl = document.getElementById('restartHint');
+    const barEl = document.getElementById('restartProgressBar');
+    const screenEmpty = document.getElementById('screenEmptyState');
+
+    const setOverlayText = (subtitle, hint) => {
+        if (subtitleEl) subtitleEl.innerText = subtitle || '';
+        if (hintEl) hintEl.innerText = hint || '';
+    };
+
+    const setOverlayProgress = (pct) => {
+        if (!barEl) return;
+        const clamped = Math.max(0, Math.min(100, pct));
+        barEl.style.width = `${clamped}%`;
+    };
+
+    const showRestartOverlay = () => {
+        if (!overlay) return;
+        overlay.classList.remove('hidden');
+        overlay.classList.remove('long-wait');
+        setOverlayProgress(3);
+    };
+
+    // allow cancel overlay (pure UI cancel, no network abort)
+    const cancelBtn = document.getElementById('restartCancelBtn');
+    const reloadBtn = document.getElementById('restartReloadBtn');
+    if (cancelBtn) {
+        cancelBtn.onclick = () => {
+            // 只关闭 overlay，不改变服务状态；适合“点了没想重启/想继续看页面”的情况
+            overlay?.classList.add('hidden');
+        };
+    }
+    if (reloadBtn) {
+        reloadBtn.classList.add('hidden');
+    }
+
+    const markLongWait = () => {
+        if (!overlay) return;
+        overlay.classList.add('long-wait');
+    };
+
+    const clearUIForRestart = () => {
+        // reset selection state
+        rootNode = null;
+        selectedNode = null;
+        hoverNode = null;
+        mapNodeToDom.clear();
+
+        // clear panels
+        treeContainer.innerHTML = '<div class="empty-state">暂无层级数据</div>';
+        propsContainer.innerHTML = '<div class="empty-state">请点击元素查看属性</div>';
+
+        // close modals if any
+        document.getElementById('deviceModal')?.classList.remove('show');
+        document.getElementById('displayModal')?.classList.remove('show');
+        document.getElementById('settingsModal')?.classList.remove('show');
+
+        // hide toast
+        closeToast();
+
+        // hide coord and secure warning
+        updateCoordDisplay(null, null);
+        hideSecureWarning();
+
+        // clear last click crosshair
+        lastClickX = null;
+        lastClickY = null;
+        if (clickCrosshairTimeout) {
+            clearTimeout(clickCrosshairTimeout);
+            clickCrosshairTimeout = null;
+        }
+
+        // reset status
+        statusBaseText = '未连接';
+        statusTags.clear();
+        renderStatus();
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+            statusEl.classList.add('status-badge');
+            statusEl.style.color = '';
+            statusEl.style.fontWeight = '';
+        }
+
+        // reset device + display selection
+        currentDevice = null;
+        currentDisplay = '0';
+        const deviceText = document.getElementById('deviceSelectText');
+        if (deviceText) deviceText.innerText = '请选择设备';
+        const displayText = document.getElementById('displaySelectText');
+        if (displayText) displayText.innerText = '默认屏幕 (0)';
+        disableDisplaySelector();
+
+        // close screenshot page (hide canvas via empty state)
+        if (screenEmpty) screenEmpty.classList.remove('hidden');
+        // Clear canvas
+        try {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            canvas.width = 1;
+            canvas.height = 1;
+        } catch (e) {
+            // ignore
+        }
+        screenImage = new Image();
+        canvas.style.cursor = 'default';
+    };
+
+    showRestartOverlay();
+    setOverlayText('正在清空现场...', '正在断开连接并准备重启服务…');
+    clearUIForRestart();
+    setOverlayProgress(12);
     
     try {
+        // --- 2) 如果当前处于“辅助服务模式”，先断开辅助服务（你希望的“断开辅助服务”） ---
+        const a11ySwitch = document.getElementById('useAccessibilityService');
+        const isA11yMode = !!(a11ySwitch && a11ySwitch.checked);
+
+        if (isA11yMode) {
+            setOverlayText('正在断开辅助服务...', '执行 /api/accessibility/disable');
+            setOverlayProgress(22);
+            try {
+                const disableRes = await fetch('/api/accessibility/disable', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                // 不强依赖成功；失败也继续重启
+                if (!disableRes.ok) {
+                    console.warn('[RestartServer] /api/accessibility/disable failed:', await disableRes.text());
+                }
+            } catch (e) {
+                console.warn('[RestartServer] disable accessibility failed:', e);
+            } finally {
+                // UI 层面关闭开关
+                a11ySwitch.checked = false;
+                const dataSourceLabel = document.getElementById('dataSourceLabel');
+                if (dataSourceLabel) dataSourceLabel.textContent = 'UIAutomator';
+            }
+        }
+
+        // --- 3) 发起后端重启请求 ---
+        setOverlayText('正在请求重启服务...', '发送 /api/restart-server');
+        setOverlayProgress(32);
+
         console.log('[RestartServer] 发送重启请求...');
         const response = await fetch('/api/restart-server', {
             method: 'POST',
@@ -1963,6 +2240,9 @@ async function restartServer() {
         if (response.ok) {
             const data = await response.json();
             console.log('[RestartServer] 服务器正在重启:', data);
+
+            setOverlayText('服务器已进入重启流程...', '正在等待服务恢复响应…');
+            setOverlayProgress(45);
             
             // 显示等待消息
             const statusEl = document.getElementById('status');
@@ -1973,11 +2253,24 @@ async function restartServer() {
             
             // 开始轮询检查服务器是否恢复
             let checkAttempts = 0;
-            const maxAttempts = 20; // 最多等待20秒
+            // 插件监控线程：5秒一次，连续失败3次才重启 => 最少约15秒才开始拉起。
+            // 这里把等待拉长，避免前端“误判超时”。
+            const maxAttempts = 60; // 最多等待60秒
+
+            // 如果等待超过 10 秒，启用“毁灭进度”抖动
+            const longWaitTimer = setTimeout(() => {
+                markLongWait();
+                setOverlayText('正在毁灭进度（等待服务复活）...', '时间有点久，但我会一直盯着…');
+            }, 10000);
             
             const checkServer = async () => {
                 checkAttempts++;
                 console.log(`[RestartServer] 检查服务器状态... (${checkAttempts}/${maxAttempts})`);
+
+                // 进度条：45% -> 95% 之间缓慢推进
+                const p = 45 + Math.floor((checkAttempts / maxAttempts) * 50);
+                setOverlayProgress(p);
+                if (subtitleEl) subtitleEl.innerText = `等待服务恢复响应... (${checkAttempts}/${maxAttempts})`;
                 
                 try {
                     const testResponse = await fetch('/api/devices', {
@@ -1993,12 +2286,17 @@ async function restartServer() {
                         }
                         btn.disabled = false;
                         btn.textContent = '🔄 重启服务';
+
+                        // overlay 收尾
+                        clearTimeout(longWaitTimer);
+                        setOverlayText('✅ 服务已恢复', '即将刷新页面…');
+                        setOverlayProgress(100);
+
+                        // show reload button (avoid alert)
+                        if (reloadBtn) reloadBtn.classList.remove('hidden');
                         
                         // 显示成功消息并刷新页面
-                        setTimeout(() => {
-                            alert('✅ 服务器重启成功！页面将自动刷新。');
-                            window.location.reload();
-                        }, 500);
+                        setTimeout(() => window.location.reload(), 600);
                         return;
                     }
                 } catch (e) {
@@ -2017,7 +2315,12 @@ async function restartServer() {
                     }
                     btn.disabled = false;
                     btn.textContent = '🔄 重启服务';
-                    alert('⚠️ 服务器重启超时。\n\n请尝试手动刷新页面（F5）或重新打开工具窗口。');
+                    clearTimeout(longWaitTimer);
+                    setOverlayText('❌ 等待超时', '你可以手动刷新（F5）或重新打开工具窗口');
+                    setOverlayProgress(100);
+
+                    // show reload button for manual action
+                    if (reloadBtn) reloadBtn.classList.remove('hidden');
                 }
             };
             
@@ -2029,10 +2332,307 @@ async function restartServer() {
         }
     } catch (e) {
         console.error('[RestartServer] 重启失败:', e);
-        alert(`❌ 重启失败: ${e.message}\n\n请手动重启服务器或重新打开工具窗口。`);
         btn.disabled = false;
         btn.textContent = '🔄 重启服务';
+
+        // overlay 失败提示
+        if (overlay) {
+            overlay.classList.add('long-wait');
+            setOverlayText('❌ 重启失败', e.message || '未知错误');
+            setOverlayProgress(100);
+        }
+
+        // show reload button for manual action
+        const reloadBtn = document.getElementById('restartReloadBtn');
+        if (reloadBtn) reloadBtn.classList.remove('hidden');
     }
+}
+
+// =========================
+// ☠️ Hard Reset: 立刻硬清空
+// =========================
+
+async function clearBrowserStateAggressively() {
+    // 1) Clear app local storage (includes uiInspectorSettings)
+    try { localStorage.clear(); } catch (e) {}
+    try { sessionStorage.clear(); } catch (e) {}
+
+    // 2) Clear CacheStorage (service worker caches) if any
+    try {
+        if (window.caches && caches.keys) {
+            const keys = await caches.keys();
+            await Promise.all(keys.map(k => caches.delete(k)));
+        }
+    } catch (e) {
+        // ignore
+    }
+
+    // 3) best-effort unregister service workers
+    try {
+        if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map(r => r.unregister()));
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+function clearUIForHardReset() {
+    const overlay = document.getElementById('restartOverlay');
+    const subtitleEl = document.getElementById('restartSubtitle');
+    const hintEl = document.getElementById('restartHint');
+    const barEl = document.getElementById('restartProgressBar');
+    const screenEmpty = document.getElementById('screenEmptyState');
+
+    const setOverlayText = (subtitle, hint) => {
+        if (subtitleEl) subtitleEl.innerText = subtitle || '';
+        if (hintEl) hintEl.innerText = hint || '';
+    };
+    const setOverlayProgress = (pct) => {
+        if (!barEl) return;
+        const clamped = Math.max(0, Math.min(100, pct));
+        barEl.style.width = `${clamped}%`;
+    };
+
+    if (overlay) {
+        overlay.classList.remove('hidden');
+        overlay.classList.remove('long-wait');
+    }
+    setOverlayText('☠️ 硬清空：正在瞬间清理前端状态...', '将立即杀死后端进程，并等待服务自动复活');
+    setOverlayProgress(10);
+
+    // reset selection state
+    rootNode = null;
+    selectedNode = null;
+    hoverNode = null;
+    mapNodeToDom.clear();
+
+    // clear panels
+    treeContainer.innerHTML = '<div class="empty-state">暂无层级数据</div>';
+    propsContainer.innerHTML = '<div class="empty-state">请点击元素查看属性</div>';
+
+    // close modals if any
+    document.getElementById('deviceModal')?.classList.remove('show');
+    document.getElementById('displayModal')?.classList.remove('show');
+    document.getElementById('settingsModal')?.classList.remove('show');
+
+    // hide toast
+    closeToast();
+
+    // hide coord and secure warning
+    updateCoordDisplay(null, null);
+    hideSecureWarning();
+
+    // clear last click crosshair
+    lastClickX = null;
+    lastClickY = null;
+    if (clickCrosshairTimeout) {
+        clearTimeout(clickCrosshairTimeout);
+        clickCrosshairTimeout = null;
+    }
+
+    // reset status
+    statusBaseText = '未连接';
+    statusTags.clear();
+    renderStatus();
+    const statusEl = document.getElementById('status');
+    if (statusEl) {
+        statusEl.classList.add('status-badge');
+        statusEl.style.color = '';
+        statusEl.style.fontWeight = '';
+    }
+
+    // reset device + display selection
+    currentDevice = null;
+    currentDisplay = '0';
+
+    // stop continuous background requests
+    try {
+        const autoRefreshEl = document.getElementById('autoRefresh');
+        if (autoRefreshEl) autoRefreshEl.checked = false;
+        const realControlEl = document.getElementById('realControl');
+        if (realControlEl) realControlEl.checked = false;
+    } catch (e) {
+        // ignore
+    }
+    const deviceText = document.getElementById('deviceSelectText');
+    if (deviceText) deviceText.innerText = '请选择设备';
+    const displayText = document.getElementById('displaySelectText');
+    if (displayText) displayText.innerText = '默认屏幕 (0)';
+    disableDisplaySelector();
+
+    // close screenshot page (hide canvas via empty state)
+    if (screenEmpty) screenEmpty.classList.remove('hidden');
+    // Clear canvas
+    try {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.width = 1;
+        canvas.height = 1;
+    } catch (e) {}
+    screenImage = new Image();
+    canvas.style.cursor = 'default';
+
+    // cancel / reload buttons in overlay
+    const cancelBtn = document.getElementById('restartCancelBtn');
+    const reloadBtn = document.getElementById('restartReloadBtn');
+    if (cancelBtn) {
+        cancelBtn.disabled = false;
+        cancelBtn.onclick = () => overlay?.classList.add('hidden');
+    }
+    if (reloadBtn) reloadBtn.classList.add('hidden');
+}
+
+async function waitServerUpAndReload(maxSeconds = 45) {
+    const subtitleEl = document.getElementById('restartSubtitle');
+    const hintEl = document.getElementById('restartHint');
+    const barEl = document.getElementById('restartProgressBar');
+    const reloadBtn = document.getElementById('restartReloadBtn');
+
+    const setText = (subtitle, hint) => {
+        if (subtitleEl) subtitleEl.innerText = subtitle || '';
+        if (hintEl) hintEl.innerText = hint || '';
+    };
+    const setProgress = (pct) => {
+        if (!barEl) return;
+        const clamped = Math.max(0, Math.min(100, pct));
+        barEl.style.width = `${clamped}%`;
+    };
+
+    // poll
+    const maxAttempts = Math.max(5, maxSeconds);
+    for (let i = 1; i <= maxAttempts; i++) {
+        setText(`等待服务复活... (${i}/${maxAttempts})`, '检测 /api/devices 可用后自动刷新');
+        setProgress(35 + Math.floor((i / maxAttempts) * 55));
+        try {
+            const res = await fetch('/api/devices', { cache: 'no-cache' });
+            if (res.ok) {
+                setText('✅ 服务已恢复', '正在安全刷新页面…');
+                setProgress(100);
+                setTimeout(() => window.location.reload(), 300);
+                return;
+            }
+        } catch (e) {
+            // ignore
+        }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // timeout
+    setText('❌ 等待超时', '你可以点“刷新页面”再试一次，或关闭/重开工具窗口');
+    setProgress(100);
+    if (reloadBtn) reloadBtn.classList.remove('hidden');
+}
+
+// 按钮入口：立刻硬清空（清 UI + 清存储 + 让后端自杀）
+async function hardResetAll() {
+    const btn = document.querySelector('.btn-hard-reset');
+    const restartBtn = document.querySelector('.btn-restart');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '☠️ 清空中...';
+    }
+    if (restartBtn) restartBtn.disabled = true;
+
+    // 1) 立刻清 UI（用户体感：瞬间断电）
+    clearUIForHardReset();
+
+    // 2) 清除前端持久化（尽可能）
+    const barEl = document.getElementById('restartProgressBar');
+    if (barEl) barEl.style.width = '20%';
+    await clearBrowserStateAggressively();
+
+    // 3) 如果原来开了辅助服务模式，尽量先 disable 一下（best-effort）
+    const a11ySwitch = document.getElementById('useAccessibilityService');
+    const isA11yMode = !!(a11ySwitch && a11ySwitch.checked);
+    if (isA11yMode) {
+        try {
+            await fetch('/api/accessibility/disable', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+        } catch (e) {}
+        // UI 层面关闭开关
+        a11ySwitch.checked = false;
+        const dataSourceLabel = document.getElementById('dataSourceLabel');
+        if (dataSourceLabel) dataSourceLabel.textContent = 'UIAutomator';
+    }
+
+    // 4) 让后端立刻自杀（会导致本请求可能失败/断开，这就是我们要的“瞬间杀死”）
+    const subtitleEl = document.getElementById('restartSubtitle');
+    const hintEl = document.getElementById('restartHint');
+    if (subtitleEl) subtitleEl.innerText = '正在强制杀死后端进程...';
+    if (hintEl) hintEl.innerText = '发送 /api/hard-exit（服务将立即断开）';
+    if (barEl) barEl.style.width = '32%';
+
+    try {
+        // 这个请求大概率会在 JCEF 里“断开”，属于正常现象
+        await fetch('/api/hard-exit', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    } catch (e) {
+        // ignore
+    }
+
+    // 5) 等待插件侧监控/重建把服务拉起来，然后安全 reload
+    if (hintEl) hintEl.innerText = '后端已被杀死（或正在死亡），等待服务复活...';
+    if (barEl) barEl.style.width = '40%';
+    await waitServerUpAndReload(60);
+
+    // 兜底：如果没 reload 就恢复按钮
+    if (btn) {
+        btn.disabled = false;
+        btn.textContent = '☠️ 硬清空';
+    }
+    if (restartBtn) restartBtn.disabled = false;
+}
+
+// 安全刷新：避免服务未恢复时直接 reload 导致 JCEF 黑屏卡死
+async function safeReloadAfterServerUp() {
+    const overlay = document.getElementById('restartOverlay');
+    const subtitleEl = document.getElementById('restartSubtitle');
+    const hintEl = document.getElementById('restartHint');
+    const barEl = document.getElementById('restartProgressBar');
+    const reloadBtn = document.getElementById('restartReloadBtn');
+    const cancelBtn = document.getElementById('restartCancelBtn');
+
+    const setText = (subtitle, hint) => {
+        if (subtitleEl) subtitleEl.innerText = subtitle || '';
+        if (hintEl) hintEl.innerText = hint || '';
+    };
+
+    const setProgress = (pct) => {
+        if (!barEl) return;
+        const clamped = Math.max(0, Math.min(100, pct));
+        barEl.style.width = `${clamped}%`;
+    };
+
+    if (overlay) overlay.classList.remove('hidden');
+    if (reloadBtn) reloadBtn.classList.add('hidden');
+    if (cancelBtn) cancelBtn.disabled = true;
+
+    setText('安全刷新：等待服务恢复...', '检测 /api/devices 可用后再刷新页面');
+    setProgress(60);
+
+    const maxAttempts = 30; // 30s
+    for (let i = 1; i <= maxAttempts; i++) {
+        try {
+            const res = await fetch('/api/devices', { cache: 'no-cache' });
+            if (res.ok) {
+                setText('✅ 服务已恢复', '正在刷新页面…');
+                setProgress(100);
+                setTimeout(() => window.location.reload(), 300);
+                return;
+            }
+        } catch (e) {
+            // ignore
+        }
+
+        setProgress(60 + Math.floor((i / maxAttempts) * 35));
+        if (subtitleEl) subtitleEl.innerText = `安全刷新：等待服务恢复... (${i}/${maxAttempts})`;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // timeout
+    setText('❌ 服务仍未恢复', '建议：稍后再点一次“刷新页面”，或直接重开工具窗口');
+    setProgress(100);
+    if (cancelBtn) cancelBtn.disabled = false;
+    if (reloadBtn) reloadBtn.classList.remove('hidden');
 }
 
 // Resizable Panels Logic

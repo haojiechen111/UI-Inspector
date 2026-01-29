@@ -14,6 +14,12 @@ import adbutils
 from adbutils import adb
 from PIL import Image
 
+# Optional dependency for local HTTP probing (best-effort)
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None
+
 app = FastAPI()
 
 # Enable CORS
@@ -75,6 +81,36 @@ hierarchy_xml_cache: Dict[int, str] = {}
 ss4_localhost_mapping: Dict[str, Dict[str, str]] = {}
 
 
+def _adb_shell_run(serial: str, cmd: str, timeout: int = 6) -> subprocess.CompletedProcess:
+    """Run adb shell and return CompletedProcess (stdout/stderr/returncode)."""
+    return subprocess.run(
+        ["adb", "-s", serial, "shell", cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _is_accessibility_shell_supported(serial: str) -> bool:
+    """Heuristic: whether this serial supports `settings`/`pm` shell commands.
+
+    Some SS4 setups use `localhost:5559` as the real Android shell, while the
+    original physical serial may not expose full Android shell commands.
+    """
+    try:
+        r = _adb_shell_run(serial, "settings get secure accessibility_enabled", timeout=4)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "not found" in out.lower():
+            return False
+        # returncode 127 often indicates command not found
+        if r.returncode == 127:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def resolve_accessibility_target_serial(serial: str) -> str:
     """辅助服务相关操作需要在“物理设备”上执行。
 
@@ -84,8 +120,64 @@ def resolve_accessibility_target_serial(serial: str) -> str:
     """
     global ss4_localhost_mapping
     if serial == "localhost:5559" and serial in ss4_localhost_mapping:
-        return ss4_localhost_mapping[serial].get("original_serial", serial)
+        candidate = ss4_localhost_mapping[serial].get("original_serial", serial)
+        # Fallback: some environments cannot run `settings/pm` on original_serial.
+        if candidate != serial and not _is_accessibility_shell_supported(candidate):
+            return serial
+        return candidate
     return serial
+
+
+def get_accessibility_candidate_serials(serial: str) -> List[str]:
+    """Return candidate serials for accessibility operations.
+
+    SS4 场景可能同时存在：
+    - localhost:5559（通常可执行完整 Android shell 命令）
+    - original_serial（某些环境下才是真正安装/运行 APK 的 serial）
+
+    为了避免“选错 serial 导致一直显示未运行”，这里返回两者并由上层逐个探测。
+    """
+    global ss4_localhost_mapping
+    if serial == "localhost:5559" and serial in ss4_localhost_mapping:
+        orig = ss4_localhost_mapping[serial].get("original_serial")
+        cands: List[str] = []
+        if orig:
+            cands.append(orig)
+        cands.append(serial)
+
+        # de-duplicate while preserving order
+        seen = set()
+        out: List[str] = []
+        for s in cands:
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    return [serial]
+
+
+def get_accessibility_target_serial_from_current() -> str:
+    """统一计算“辅助服务相关操作”的目标 serial。
+
+    这里必须使用 resolve_accessibility_target_serial，而不要在各处直接用
+    ss4_localhost_mapping["localhost:5559"]["original_serial"]。
+
+    原因：SS4 场景下 original_serial 有时不支持 settings/pm 等 shell 命令，
+    或者端口转发/HTTP 探测应该对 localhost:5559 生效。
+    """
+    global current_serial
+    if not current_serial:
+        return ""
+    return resolve_accessibility_target_serial(current_serial)
+
+
+def pick_accessibility_shell_serial(serial: str) -> str:
+    """Pick a serial that can run `settings/pm` shell commands."""
+    cands = get_accessibility_candidate_serials(serial)
+    for s in cands:
+        if _is_accessibility_shell_supported(s):
+            return s
+    return cands[0] if cands else serial
 
 
 def _adb_shell(serial: str, cmd: str, timeout: int = 5) -> str:
@@ -629,11 +721,21 @@ def check_accessibility_service(serial: str) -> bool:
     """检查辅助服务是否可用"""
     try:
         # 设置端口转发
-        subprocess.run(["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"], 
-                      capture_output=True, timeout=3, check=False)
+        fw = subprocess.run(
+            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if fw.returncode != 0:
+            print(f"[Accessibility] ⚠️ adb forward failed on {serial}: {fw.stderr.strip()}")
         
+        if requests is None:
+            print("[Accessibility] ⚠️ Python requests not installed, cannot probe /api/status")
+            return False
+
         # 测试连接
-        import requests
         response = requests.get("http://localhost:8765/api/status", timeout=2)
         if response.status_code == 200:
             data = response.json()
@@ -641,8 +743,200 @@ def check_accessibility_service(serial: str) -> bool:
                 print(f"[Accessibility] ✅ 辅助服务可用")
                 return True
     except Exception as e:
-        print(f"[Accessibility] ⚠️ 辅助服务不可用: {e}")
+        print(f"[Accessibility] ⚠️ 辅助服务不可用(serial={serial}): {e}")
     return False
+
+
+def probe_accessibility_service(serial: str) -> Dict:
+    """Probe accessibility service and return details for diagnosis.
+
+    Returns:
+      {
+        ok: bool,
+        forward_ok: bool,
+        forward_stderr: str,
+        http_ok: bool,
+        http_error: str,
+        status_json: dict|None,
+      }
+    """
+    info: Dict = {
+        "ok": False,
+        "forward_ok": False,
+        "forward_stderr": "",
+        "http_ok": False,
+        "http_error": "",
+        "status_json": None,
+    }
+
+    try:
+        fw = subprocess.run(
+            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        info["forward_ok"] = fw.returncode == 0
+        info["forward_stderr"] = (fw.stderr or "").strip()
+
+        if requests is None:
+            info["http_error"] = "python requests not installed"
+            return info
+
+        try:
+            resp = requests.get("http://localhost:8765/api/status", timeout=2)
+            if resp.status_code == 200:
+                info["http_ok"] = True
+                try:
+                    info["status_json"] = resp.json()
+                except Exception:
+                    info["status_json"] = None
+            else:
+                info["http_error"] = f"HTTP {resp.status_code}"
+        except Exception as e:
+            info["http_error"] = str(e)
+
+        info["ok"] = bool(info["http_ok"] and (info.get("status_json") or {}).get("service") == "running")
+        return info
+    except Exception as e:
+        info["http_error"] = str(e)
+        return info
+
+
+def probe_accessibility_service_any(serial: str) -> Dict:
+    """Probe possible serials and return the first successful result.
+
+    Returns a dict with extra keys:
+      - candidates: [..]
+      - ok_serial: str
+      - by_serial: {serial: probe_dict}
+    """
+    candidates = get_accessibility_candidate_serials(serial)
+    by_serial: Dict[str, Dict] = {}
+    ok_serial = ""
+    ok = False
+    for s in candidates:
+        r = probe_accessibility_service(s)
+        by_serial[s] = r
+        if not ok and r.get("ok"):
+            ok = True
+            ok_serial = s
+    return {
+        "ok": ok,
+        "ok_serial": ok_serial,
+        "candidates": candidates,
+        "by_serial": by_serial,
+    }
+
+
+def _adb_run(args: List[str], timeout: int = 10) -> subprocess.CompletedProcess:
+    """Run adb subprocess (best-effort, capture output)."""
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def ensure_accessibility_service(serial: str, apk_path: Optional[str] = None, install_if_missing: bool = True) -> Dict:
+    """Ensure CarUI accessibility service is installed, enabled and running.
+
+    This is designed for 'one-click' UX:
+    - Optional install/update APK
+    - Enable service in secure settings (requires root / WRITE_SECURE_SETTINGS / userdebug)
+    - Forward 8765 and verify /api/status
+    """
+    result: Dict = {
+        "serial": serial,
+        "target_serial": resolve_accessibility_target_serial(serial),
+        "apk_installed": None,
+        "apk_install_attempted": False,
+        "enabled": False,
+        "running": False,
+        "steps": [],
+        "error": None,
+    }
+
+    target_serial = result["target_serial"]
+
+    def step(msg: str):
+        print(f"[Accessibility][Ensure] {msg}")
+        result["steps"].append(msg)
+
+    try:
+        # 0) Validate adb device
+        step(f"Using target_serial={target_serial}")
+
+        # 1) Check APK installed
+        pkg = "com.carui.accessibility"
+        r = _adb_run(["adb", "-s", target_serial, "shell", "pm", "path", pkg], timeout=8)
+        installed = (r.returncode == 0) and ("package:" in (r.stdout or ""))
+        result["apk_installed"] = installed
+        step(f"APK installed? {installed}")
+
+        # 2) Install if missing (or user provided path)
+        if (not installed) and install_if_missing:
+            # If path not specified, try default build output relative to repo/plugin
+            if not apk_path:
+                # server/main.py is inside <plugin>/server
+                # Try to locate apk built by compile_apk.sh
+                candidate = os.path.abspath(os.path.join(script_dir, "..", "accessibility_service", "build", "outputs", "apk", "debug", "accessibility_service-debug.apk"))
+                if os.path.exists(candidate):
+                    apk_path = candidate
+
+            if apk_path and os.path.exists(apk_path):
+                result["apk_install_attempted"] = True
+                step(f"Installing APK: {apk_path}")
+                ir = _adb_run(["adb", "-s", target_serial, "install", "-r", apk_path], timeout=90)
+                if ir.returncode != 0:
+                    step(f"APK install failed: {ir.stderr.strip()}")
+                else:
+                    step("APK install success")
+                    result["apk_installed"] = True
+            else:
+                step("APK missing and no apk_path provided")
+
+        # 3) Enable secure settings (requires privileged environment)
+        # Read current services
+        r = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
+        current_services = (r.stdout or "").strip()
+        component = "com.carui.accessibility/.CarUIAccessibilityService"
+        if "com.carui.accessibility" in current_services:
+            step("Service already in enabled_accessibility_services")
+        else:
+            new_services = (
+                f"{current_services}:{component}" if current_services and current_services != "null" else component
+            )
+            step(f"Enabling service via secure settings: {component}")
+            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services], timeout=6)
+
+        _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+
+        # 4) Forward and probe running
+        _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
+
+        # Poll up to 4s
+        import time
+        enabled_services_now = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6).stdout.strip()
+        result["enabled"] = "com.carui.accessibility" in (enabled_services_now or "")
+
+        step(f"Enabled now? {result['enabled']}")
+
+        running = False
+        for i in range(1, 9):
+            if check_accessibility_service(target_serial):
+                running = True
+                break
+            time.sleep(0.5)
+        result["running"] = running
+        step(f"Running? {running}")
+
+        if not result["enabled"]:
+            step("WARNING: enable may require root/WRITE_SECURE_SETTINGS; please enable manually in Settings")
+        if not result["running"]:
+            step("WARNING: service not responding on 8765; please open Accessibility settings and toggle service")
+
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        return result
 
 def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[str]:
     """从辅助服务获取UI树并转换为XML格式"""
@@ -1317,12 +1611,11 @@ def enable_accessibility_service():
     global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
-    
-    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
-    target_serial = current_serial
-    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
-        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
-        print(f"[Accessibility] 🔧 SS4设备，使用原始序列号操作: {target_serial} (而非 {current_serial})")
+
+    # 统一使用 resolve_accessibility_target_serial，避免 SS4 上 serial 选择不一致
+    target_serial = get_accessibility_target_serial_from_current()
+    if target_serial != current_serial:
+        print(f"[Accessibility] 🔧 目标设备序列号修正: {current_serial} -> {target_serial}")
     
     try:
         print(f"[Accessibility] 🔧 启用辅助服务...")
@@ -1386,18 +1679,36 @@ def enable_accessibility_service():
         print(f"[Accessibility] ❌ 启用失败: {e}")
         raise HTTPException(status_code=500, detail=f"启用辅助服务失败: {str(e)}")
 
+
+class EnsureAccessibilityRequest(BaseModel):
+    serial: Optional[str] = None
+    apk_path: Optional[str] = None
+    install_if_missing: bool = True
+
+
+@app.post("/api/accessibility/ensure")
+def api_ensure_accessibility(req: EnsureAccessibilityRequest):
+    """One-click ensure accessibility service is installed/enabled/running.
+
+    If req.serial is empty, uses current_serial.
+    """
+    global current_serial
+    serial = req.serial or current_serial
+    if not serial:
+        raise HTTPException(status_code=400, detail="Device not connected")
+    return ensure_accessibility_service(serial, apk_path=req.apk_path, install_if_missing=req.install_if_missing)
+
 @app.post("/api/accessibility/disable")
 def disable_accessibility_service():
     """禁用辅助服务，恢复原有服务（如语音服务）"""
     global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
-    
-    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
-    target_serial = current_serial
-    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
-        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
-        print(f"[Accessibility] 🛑 SS4设备，使用原始序列号操作: {target_serial} (而非 {current_serial})")
+
+    # 统一使用 resolve_accessibility_target_serial，避免 SS4 上 serial 选择不一致
+    target_serial = get_accessibility_target_serial_from_current()
+    if target_serial != current_serial:
+        print(f"[Accessibility] 🛑 目标设备序列号修正: {current_serial} -> {target_serial}")
     
     try:
         print(f"[Accessibility] 🛑 禁用辅助服务...")
@@ -1453,33 +1764,63 @@ def get_accessibility_status():
     global current_serial, ss4_localhost_mapping
     if not current_serial:
         raise HTTPException(status_code=400, detail="Device not connected")
-    
-    # 对于SS4设备（localhost:5559），使用原始物理设备序列号操作辅助服务
-    target_serial = current_serial
-    if current_serial == "localhost:5559" and current_serial in ss4_localhost_mapping:
-        target_serial = ss4_localhost_mapping[current_serial]["original_serial"]
-        print(f"[Accessibility] 📊 SS4设备，使用原始序列号查询状态: {target_serial} (而非 {current_serial})")
+
+    # enabled 检测依赖 settings 命令，优先挑能跑 settings 的 serial
+    shell_serial = pick_accessibility_shell_serial(current_serial)
+    # probe 需要探测 HTTP 服务，SS4 场景下可能需要在 original_serial / localhost 两者之间尝试
+    probe_any = probe_accessibility_service_any(current_serial)
+    probe_ok_serial = probe_any.get("ok_serial") or ""
+    # 对外仍保留 target_serial 字段：表示本次探测认为更可能有效的 serial
+    target_serial = probe_ok_serial or shell_serial or current_serial
+    if target_serial != current_serial:
+        print(f"[Accessibility] 📊 目标设备序列号修正: {current_serial} -> {target_serial}")
     
     try:
         print(f"[Accessibility] 📊 查询辅助服务状态...")
         print(f"[Accessibility] 📱 目标设备: {target_serial}")
         
-        # 检查是否启用
-        result = subprocess.run(
-            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
-            capture_output=True, text=True, timeout=3
-        )
-        
-        enabled_services = result.stdout.strip()
-        is_enabled = "com.carui.accessibility" in enabled_services
-        
-        # 检查是否运行中（使用target_serial）
-        is_running = check_accessibility_service(target_serial)
+        enabled_services = ""
+        is_enabled = False
+        enabled_check_error = ""
+
+        # 检查是否启用（注意：部分车机/SS4 环境 settings 命令可能不可用）
+        try:
+            result = subprocess.run(
+                [
+                    "adb",
+                    "-s",
+                    shell_serial,
+                    "shell",
+                    "settings",
+                    "get",
+                    "secure",
+                    "enabled_accessibility_services",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            enabled_services = (result.stdout or "").strip()
+            combined = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0 or "not found" in combined.lower():
+                enabled_check_error = (result.stderr or "").strip() or combined.strip() or "settings command failed"
+            is_enabled = "com.carui.accessibility" in enabled_services
+        except Exception as e:
+            enabled_check_error = str(e)
+
+        is_running = bool(probe_any.get("ok"))
         
         return {
+            "serial": current_serial,
+            "target_serial": target_serial,
+            "shell_serial": shell_serial,
             "enabled": is_enabled,
             "running": is_running,
             "all_services": enabled_services
+            ,
+            "enabled_check_error": enabled_check_error,
+            "probe": probe_any,
         }
     
     except Exception as e:
@@ -1491,17 +1832,34 @@ def restart_server():
     global current_serial
     try:
         import signal
+        import time
         
         # 获取当前进程的PID
         current_pid = os.getpid()
         print(f"[RESTART] 🔄 准备重启服务器，当前PID: {current_pid}")
+
+        # 写入“重启请求标记文件”，让 IDE 插件侧可以立即感知并主动重启进程
+        # （避免监控线程 5s*3 次失败后才重启，导致用户体感很慢）
+        try:
+            flag_path = os.path.join(script_dir, "restart_requested.flag")
+            with open(flag_path, "w", encoding="utf-8") as f:
+                f.write(f"pid={current_pid}\n")
+                f.write(f"ts={int(time.time())}\n")
+            print(f"[RESTART] 🏁 写入重启标记文件: {flag_path}")
+        except Exception as e:
+            print(f"[RESTART] ⚠️ 写入重启标记文件失败: {e}")
         
         # 在重启前先禁用辅助服务，恢复设备原有服务
+        # 注意：SS4 场景下 current_serial 可能是 localhost:5559，但辅助服务运行在原始物理 serial 上。
         if current_serial:
             try:
                 print(f"[RESTART] 🛑 重启前禁用辅助服务...")
+                target_serial = resolve_accessibility_target_serial(current_serial)
+                if target_serial != current_serial:
+                    print(f"[RESTART] ♿ SS设备修正辅助服务目标序列号: {current_serial} -> {target_serial}")
+
                 result = subprocess.run(
-                    ["adb", "-s", current_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+                    ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
                     capture_output=True, text=True, timeout=3
                 )
                 
@@ -1514,7 +1872,7 @@ def restart_server():
                     new_services = ':'.join(services_list)
                     
                     subprocess.run(
-                        ["adb", "-s", current_serial, "shell", "settings", "put", "secure", 
+                        ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
                          "enabled_accessibility_services", new_services],
                         capture_output=True, text=True, timeout=3
                     )
@@ -1526,11 +1884,28 @@ def restart_server():
                 print(f"[RESTART] ⚠️ 禁用辅助服务失败: {e}，继续重启")
         
         # 返回成功响应后，延迟终止进程（让响应能够发送出去）
+        # NOTE: 某些环境下 uvicorn/依赖线程对 SIGTERM 退出不够“干练”，这里做硬退出兜底。
         def delayed_restart():
-            import time
-            time.sleep(0.5)  # 等待响应发送
-            print(f"[RESTART] 💀 终止当前进程...")
-            os.kill(current_pid, signal.SIGTERM)
+            time.sleep(0.25)  # 等待响应发送（尽量短）
+            print(f"[RESTART] 💀 终止当前进程 (SIGTERM)...")
+            try:
+                os.kill(current_pid, signal.SIGTERM)
+            except Exception as _e:
+                print(f"[RESTART] ⚠️ SIGTERM failed: {_e}")
+
+            # 再给一点点时间做优雅退出，否则直接 SIGKILL
+            time.sleep(0.4)
+            try:
+                print(f"[RESTART] ☠️ 强制终止当前进程 (SIGKILL)...")
+                os.kill(current_pid, signal.SIGKILL)
+            except Exception as _e:
+                print(f"[RESTART] ⚠️ SIGKILL failed: {_e}")
+
+            # 最终兜底：硬退出
+            try:
+                os._exit(0)
+            except Exception:
+                pass
         
         # 在后台线程中执行重启
         import threading
@@ -1544,6 +1919,38 @@ def restart_server():
     except Exception as e:
         print(f"[RESTART] ❌ 重启失败: {e}")
         raise HTTPException(status_code=500, detail=f"重启失败: {str(e)}")
+
+
+@app.post("/api/hard-exit")
+def hard_exit():
+    """瞬间杀死 Python 服务进程（不给 uvicorn/线程留情面）。
+
+    插件侧 hardStop 已经很暴力了；这个接口主要用于：
+    - 前端想“立刻断电”，直接让当前 server 自杀
+    - 某些情况下 process 句柄丢失，仍可通过 HTTP 让其自杀
+    """
+    try:
+        import signal
+        import threading
+        import time
+
+        pid = os.getpid()
+        print(f"[HARD_EXIT] ☠️ hard exit requested, pid={pid}")
+
+        def killer():
+            time.sleep(0.15)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    os._exit(0)
+                except Exception:
+                    pass
+
+        threading.Thread(target=killer, daemon=True).start()
+        return {"status": "ok", "pid": pid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def read_root():
@@ -1568,14 +1975,46 @@ def find_available_port(start_port=18888, max_attempts=10):
     # If no port found, raise error
     raise RuntimeError(f"No available port found in range {start_port}-{start_port + max_attempts - 1}")
 
+
+def try_bind_port(port: int) -> bool:
+    """Best-effort check if a port is available by binding to it."""
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('127.0.0.1', port))
+        sock.close()
+        return True
+    except Exception:
+        return False
+
+
+def read_preferred_port(port_file: str) -> Optional[int]:
+    """Prefer reusing last port so that JCEF page origin stays stable across restart/hard-exit."""
+    try:
+        if os.path.exists(port_file):
+            txt = open(port_file, 'r', encoding='utf-8').read().strip()
+            if txt:
+                p = int(txt)
+                if 1024 < p < 65535:
+                    return p
+    except Exception:
+        return None
+    return None
+
 if __name__ == "__main__":
     # Find available port
     try:
-        port = find_available_port(start_port=18888, max_attempts=10)
+        # Try to reuse last port first (stable origin for embedded JCEF)
+        port_file = os.path.join(os.path.dirname(__file__), "server_port.txt")
+        preferred = read_preferred_port(port_file)
+        if preferred and try_bind_port(preferred):
+            port = preferred
+            print(f"🔁 Reusing previous port: {port}")
+        else:
+            port = find_available_port(start_port=18888, max_attempts=10)
         print(f"🚀 Starting server on port {port}")
         
         # Write port to file for plugin to read
-        port_file = os.path.join(os.path.dirname(__file__), "server_port.txt")
         with open(port_file, 'w') as f:
             f.write(str(port))
         print(f"📝 Port number saved to {port_file}")

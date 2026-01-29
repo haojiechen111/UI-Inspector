@@ -447,7 +447,63 @@ body {
 
 .btn-connect:active {
     transform: translateY(0) scale(0.95);
-    box-shadow: 0 2px 4px rgba(16, 185, 129, 0.3);
+    box-shadow: 0 2px 6px rgba(16, 185, 129, 0.3);
+}
+
+.btn-connect:disabled {
+    background: #6b7280;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+/* SS4初始化进度指示器 */
+.init-progress {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(251, 191, 36, 0.1);
+    padding: 6px 12px;
+    border-radius: 12px;
+    backdrop-filter: blur(10px);
+    z-index: 10;
+}
+
+.progress-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #f59e0b;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.progress-text {
+    font-size: 12px;
+    color: #f59e0b;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* 闪烁动画 - 用于高亮新连接的设备 */
+@keyframes pulse {
+    0%, 100% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+        border-color: var(--primary-color);
+    }
+    50% {
+        box-shadow: 0 0 0 8px rgba(59, 130, 246, 0);
+        border-color: #60a5fa;
+    }
 }
 
 /* Toast Notification for connection log */
@@ -802,6 +858,37 @@ body {
     padding: 40px;
     position: relative;
 }
+
+/* Screen empty state (when screenshot is closed/reset) */
+.screen-empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px dashed rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    margin: 18px;
+    z-index: 5;
+    backdrop-filter: blur(4px);
+}
+
+.screen-empty-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #e5e7eb;
+    letter-spacing: 0.2px;
+}
+
+.screen-empty-desc {
+    font-size: 13px;
+    color: #9ca3af;
+}
+
+/* 已移除“毁灭进度”Overlay 样式（不再阻塞用户操作） */
 
 canvas {
     margin: auto;
@@ -1688,54 +1775,7 @@ input:checked+.slider::before {
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-/* 重启服务器按钮样式 */
-.btn-restart {
-    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-    color: white;
-    border: none;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: 0 2px 6px rgba(239, 68, 68, 0.3);
-    position: relative;
-    overflow: hidden;
-    font-size: 14px;
-}
-
-.btn-restart::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
-    transition: left 0.5s;
-}
-
-.btn-restart:hover::before {
-    left: 100%;
-}
-
-.btn-restart:hover {
-    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.5);
-    transform: translateY(-2px);
-}
-
-.btn-restart:active {
-    transform: translateY(0) scale(0.98);
-    box-shadow: 0 2px 4px rgba(239, 68, 68, 0.3);
-}
-
-.btn-restart:disabled {
-    background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%);
-    cursor: not-allowed;
-    opacity: 0.6;
-    transform: none;
-}
+/* 已移除“重启服务/硬清空”按钮样式 */
 
 /* Secure/black screenshot warning bar */
 .secure-warning {

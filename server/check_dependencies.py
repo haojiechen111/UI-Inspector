@@ -88,6 +88,7 @@ def check_dependencies():
         "fastapi": "fastapi",
         "uvicorn": "uvicorn",
         "adbutils": "adbutils",
+        "requests": "requests",
         "PIL": "pillow",  # Pillow uses PIL as import name
         "urllib3": "urllib3"
     }

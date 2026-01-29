@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>车载 UI 工具</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=5">
+    <link rel="stylesheet" href="style.css?v=8">
 </head>
 
 <body>
@@ -46,7 +46,7 @@
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
             <span id="status" class="status-badge">未连接</span>
             <button class="btn-icon" onclick="showSettingsModal()" title="搜索高亮设置">🔍</button>
-            <button class="btn-restart" onclick="restartServer()" title="重启Python服务器进程">🔄 重启服务</button>
+            <!-- 已移除“重启服务/硬清空”按钮：推荐通过关闭/重开 ToolWindow 触发重置 -->
         </div>
     </div>
 
@@ -73,6 +73,10 @@
                 </div>
             </div>
             <div id="screen-container">
+                <div id="screenEmptyState" class="screen-empty-state hidden">
+                    <div class="screen-empty-title">📴 截屏已关闭</div>
+                    <div class="screen-empty-desc">重启服务/断开连接后将不会显示截图</div>
+                </div>
                 <canvas id="deviceScreen"></canvas>
             </div>
         </div>
@@ -113,6 +117,8 @@
         <div class="spinner"></div>
         <p id="loadingText">加载中...</p>
     </div>
+
+    <!-- 已移除“毁灭进度”Overlay -->
 
     <!-- Toast Notification -->
     <div id="connectionToast">
@@ -187,7 +193,7 @@
         </div>
     </div>
 
-    <script src="app.js?v=5"></script>
+    <script src="app.js?v=10"></script>
 </body>
 
 </html>
