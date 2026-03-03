@@ -141,6 +141,7 @@ gradle buildPlugin
 - Integrated Python backend logic.
 - **SS4 device auto-detection and initialization**
 - **Custom modal dialogs for device/display selection** (better than native select)
+- **默认使用辅助服务（AccessibilityService）获取节点，可手动切换到 UIAutomator**
 
 ## Server Configuration
 - **Port**: `18888` (changed from 8000 to avoid conflicts with other services)
@@ -175,7 +176,7 @@ cd accessibility_service
 
 # 2. 等待Gradle同步完成
 # 3. 选择 Build → Build Bundle(s) / APK(s) → Build APK(s)
-# 4. APK位置: build/outputs/apk/debug/accessibility_service-debug.apk
+# 4. APK位置: build/outputs/apk/debug/CarUIAccessibilityService-debug.apk
 ```
 
 **方式2：使用命令行**
@@ -190,7 +191,7 @@ gradle assembleDebug
 
 ```bash
 # 1. 安装APK
-adb install -r accessibility_service/build/outputs/apk/debug/accessibility_service-debug.apk
+adb install -r accessibility_service/build/outputs/apk/debug/CarUIAccessibilityService-debug.apk
 
 # 2. 在设备上启用辅助服务
 # - 打开"CarUI Accessibility"应用
@@ -203,6 +204,37 @@ curl http://localhost:8765/api/status
 ```
 
 📖 **详细文档：** 查看 [`accessibility_service/README.md`](accessibility_service/README.md)
+
+---
+
+## 数据源（默认辅助服务 / 可切换 UIAutomator）
+
+Web UI 顶部有一个“数据源”开关：
+
+- **默认：辅助服务**（适合分屏、滚动列表、截图受限等场景；SS4 也支持端口连接）
+- 手动关闭后：**UIAutomator**（兼容传统安卓设备/场景）
+
+你提到的“自由对话开关”开启后，通常意味着车机侧无障碍能力已打开；此时建议保持默认的“辅助服务”模式。
+
+---
+
+## 连接设备时自动安装无障碍 APK（无需手动 adb install）
+
+从 **v1.0.0+** 起，插件在你点击“连接设备”成功后，会自动检查并在必要时安装：
+
+`CarUIAccessibilityService-debug.apk`
+
+实现方式：该 APK 会被打包进插件安装目录的 `server/` 目录中，Web UI 连接成功后会调用：
+
+`POST /api/accessibility/ensure`（仅安装模式：`enable_service=false, probe_running=false`）
+
+因此你不需要再手动执行：
+
+```bash
+adb install -r accessibility_service/build/outputs/apk/debug/CarUIAccessibilityService-debug.apk
+```
+
+> 注意：自动安装只负责“装 APK”；是否启用无障碍服务仍取决于你是否打开了 Web UI 顶部的“数据源=辅助服务”，以及设备侧是否允许写 secure settings / root。
 
 ---
 
@@ -279,6 +311,28 @@ python main.py
 - ✅ Fixed SS4 device detection (direct string matching)
 - ✅ Replaced native `<select>` with custom modal dialogs to fix WebView click issues
 - ✅ Changed default port from 8000 to 18888 to avoid port conflicts
+
+## 可见即可说（Text Visible Speak）一键启动（集成到插件）
+
+插件 ToolWindow 顶部新增按钮：**“启动可见即可说模拟”**。
+
+点击后会在电脑上启动一个独立的 Python GUI（tkinter），用于：
+- 自动 `adb forward tcp:27183 tcp:27183`
+- 启动设备端 `TextVisibleSpeakRemoteService`
+- 在 GUI 中输入文本，触发设备端“可见即可说”执行（依赖设备端能力）
+
+### 依赖
+- `adb` 在 PATH 中可用
+- `python3`/`python` 可用，且 **tkinter** 可用
+  - Ubuntu/Debian: `sudo apt-get install python3-tk`
+
+### 设备端要求（重要）
+该功能只负责启动 PC 侧 GUI。
+
+设备端必须已集成并注册：
+- `com.chehejia.car.voice/.TextVisibleSpeakRemoteService`
+
+并且设备端无障碍服务需启用（否则 RouterService 无法执行点击）。
 
 ## Cross-Platform Compatibility
 This plugin has been designed to work seamlessly across major operating systems:

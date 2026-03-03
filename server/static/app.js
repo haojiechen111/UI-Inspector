@@ -343,8 +343,8 @@ function updateDeviceModalList() {
         text.innerHTML = `<strong>${d.model}</strong><br><small style="color: #6b7280">${d.serial}${ssLabel}</small>`;
         item.appendChild(text);
         
-        // 检查是否是未连接的SS4设备
-        const isUnconnectedSS4 = d.ss_type === 'SS4' && d.serial !== 'localhost:5559';
+        // 是否需要初始化（后端负责判断；避免前端用 serial 硬编码误判）
+        const isUnconnectedSS4 = !!d.needs_init;
         
         if (isUnconnectedSS4) {
             // 未连接标识
@@ -668,8 +668,11 @@ window.onload = () => {
     // 监听数据源开关变化 - 只更新标签，不立即启用/禁用服务
     const dataSourceSwitch = document.getElementById('useAccessibilityService');
     const dataSourceLabel = document.getElementById('dataSourceLabel');
-    
+
+    // 默认策略：如果 index.html 把开关设为 checked，则这里同步 label（防止 JCEF/缓存导致 label 不一致）
     if (dataSourceSwitch && dataSourceLabel) {
+        dataSourceLabel.textContent = dataSourceSwitch.checked ? '辅助服务' : 'UIAutomator';
+
         dataSourceSwitch.addEventListener('change', function() {
             if (this.checked) {
                 dataSourceLabel.textContent = '辅助服务';
@@ -678,11 +681,10 @@ window.onload = () => {
                 dataSourceLabel.textContent = 'UIAutomator';
                 console.log('[DataSource] 已选择UIAutomator模式');
             }
-            
-            // 如果已连接设备，提示需要重新连接才能生效
+
+            // 如果已连接设备，刷新hierarchy以使用新的数据源
             if (rootNode) {
                 console.log('[DataSource] ⚠️ 数据源已更改，刷新后将使用新的数据源');
-                // 刷新hierarchy以使用新的数据源
                 refreshHierarchy();
             }
         });
@@ -980,35 +982,78 @@ async function connectDevice() {
         
         addLogEntry(`✅ 连接成功: ${productName}`, 'success');
 
-        // Step 4: If user selected accessibility mode, do one-click ensure (install/enable/probe)
+        // Step 3.5: Always ensure accessibility APK is installed (no manual install required).
+        // This does NOT enable accessibility or probe 8765; it only installs if missing.
+        try {
+            addLogEntry('📦 检查/安装 CarUI 无障碍APK（自动）...', 'info');
+            const ensureApkRes = await fetch('/api/accessibility/ensure', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    serial: targetSerial,
+                    install_if_missing: true,
+                    enable_service: false,
+                    probe_running: false
+                })
+            });
+            if (ensureApkRes.ok) {
+                const ensureApkData = await ensureApkRes.json();
+                if (ensureApkData && Array.isArray(ensureApkData.steps)) {
+                    ensureApkData.steps.forEach(s => addLogEntry(`📦 ${s}`, 'info'));
+                }
+                if (ensureApkData.apk_installed) {
+                    addLogEntry('✅ 无障碍APK已就绪（已安装或已自动安装）', 'success');
+                } else {
+                    addLogEntry('⚠️ 无障碍APK未安装（可能是 adb/权限/serial 问题）', 'warning');
+                }
+            } else {
+                const errText = await ensureApkRes.text();
+                addLogEntry(`⚠️ 自动安装APK失败: ${errText}`, 'warning');
+            }
+        } catch (e) {
+            addLogEntry(`⚠️ 自动安装APK异常: ${e.message}`, 'warning');
+        }
+
+        // Step 4: If user selected accessibility mode, prefer "status check" first.
+        // If already running, don't touch secure settings (fits your "我肯定会打开" usage).
         const useAccessibility = document.getElementById('useAccessibilityService')?.checked;
         if (useAccessibility) {
-            addLogEntry('♿ 一键启动辅助服务（安装/启用/校验）...', 'info');
             try {
-                const ensureRes = await fetch('/api/accessibility/ensure', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ serial: targetSerial, install_if_missing: true })
-                });
-
-                if (ensureRes.ok) {
-                    const ensureData = await ensureRes.json();
-                    // Print steps to toast
-                    if (ensureData && Array.isArray(ensureData.steps)) {
-                        ensureData.steps.forEach(s => addLogEntry(`♿ ${s}`, 'info'));
-                    }
-
-                    if (ensureData.running) {
-                        addLogEntry('✅ 辅助服务已运行并通过校验 (/api/status)', 'success');
-                    } else {
-                        addLogEntry('⚠️ 辅助服务未能自动拉起（可能需要ROOT/系统权限或手动在设置里开启）', 'warning');
-                    }
+                const st = await fetchAccessibilityStatus();
+                if (st && st.running) {
+                    addLogEntry('✅ 辅助服务已在运行（跳过一键启用）', 'success');
                 } else {
-                    const errText = await ensureRes.text();
-                    addLogEntry(`⚠️ 一键启动辅助服务失败: ${errText}`, 'warning');
+                    addLogEntry('♿ 一键启动辅助服务（安装/启用/校验）...', 'info');
+                    const ensureRes = await fetch('/api/accessibility/ensure', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            serial: targetSerial,
+                            install_if_missing: true,
+                            enable_service: true,
+                            probe_running: true
+                        })
+                    });
+
+                    if (ensureRes.ok) {
+                        const ensureData = await ensureRes.json();
+                        // Print steps to toast
+                        if (ensureData && Array.isArray(ensureData.steps)) {
+                            ensureData.steps.forEach(s => addLogEntry(`♿ ${s}`, 'info'));
+                        }
+
+                        if (ensureData.running) {
+                            addLogEntry('✅ 辅助服务已运行并通过校验 (/api/status)', 'success');
+                        } else {
+                            addLogEntry('⚠️ 辅助服务未能自动拉起（可能需要ROOT/系统权限或手动在设置里开启）', 'warning');
+                        }
+                    } else {
+                        const errText = await ensureRes.text();
+                        addLogEntry(`⚠️ 一键启动辅助服务失败: ${errText}`, 'warning');
+                    }
                 }
             } catch (e) {
-                addLogEntry(`⚠️ 一键启动辅助服务异常: ${e.message}`, 'warning');
+                addLogEntry(`⚠️ 辅助服务检查/拉起异常: ${e.message}`, 'warning');
             }
         }
 

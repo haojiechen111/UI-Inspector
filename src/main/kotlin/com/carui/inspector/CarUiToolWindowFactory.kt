@@ -10,6 +10,8 @@ import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.application.ApplicationManager
 import java.awt.BorderLayout
+import java.awt.FlowLayout
+import javax.swing.JButton
 import javax.swing.JPanel
 
 class CarUiToolWindowFactory : ToolWindowFactory {
@@ -20,6 +22,16 @@ class CarUiToolWindowFactory : ToolWindowFactory {
 
         // ToolWindow 关闭默认只是“隐藏”，不会销毁内容；所以要自己做 hard reset。
         val panel = JPanel(BorderLayout())
+
+        // 顶部工具条：放一些“外部辅助工具”按钮，不影响现有 WebView。
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 8, 6))
+        val btnTextVisibleSpeak = JButton("启动可见即可说模拟")
+        btnTextVisibleSpeak.toolTipText = "启动 Text Visible Speak PC GUI（需要 python3+tkinter + adb；设备端需集成对应 Service）"
+        btnTextVisibleSpeak.addActionListener {
+            TextVisibleSpeakLauncher.launch(project, pluginPath)
+        }
+        toolbar.add(btnTextVisibleSpeak)
+        panel.add(toolbar, BorderLayout.NORTH)
 
         val loadingHtml = """
             <html>
@@ -38,6 +50,7 @@ class CarUiToolWindowFactory : ToolWindowFactory {
 
         fun attachBrowser(newBrowser: JBCefBrowser) {
             panel.removeAll()
+            panel.add(toolbar, BorderLayout.NORTH)
             panel.add(newBrowser.component, BorderLayout.CENTER)
             panel.revalidate()
             panel.repaint()
@@ -289,6 +302,7 @@ class CarUiToolWindowFactory : ToolWindowFactory {
                     ApplicationManager.getApplication().invokeLater {
                         try {
                             panel.removeAll()
+                            panel.add(toolbar, BorderLayout.NORTH)
                             panel.revalidate()
                             panel.repaint()
                         } catch (_: Exception) {

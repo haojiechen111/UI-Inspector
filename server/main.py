@@ -365,8 +365,19 @@ def get_devices():
     global ss4_localhost_mapping
     try:
         devices = []
+        # 如果 adb 设备列表里已经有 localhost:5559（说明端口设备已建立），
+        # 那么把 SS4 的“原始物理 serial”隐藏掉，避免 UI 里继续显示“未连接”。
+        # 这是一个 UX 规则：SS4 用户只需要操作 localhost:5559 这个入口。
+        has_localhost_5559 = any(d.serial == "localhost:5559" for d in adb.device_list())
         for d in adb.device_list():
             model = d.prop.get("ro.product.model", "Unknown")
+
+            # 已经存在 localhost:5559 时：隐藏其他 SS4 物理 serial
+            if has_localhost_5559 and d.serial != "localhost:5559":
+                ss_type_tmp = detect_ss_device(d.serial)
+                if ss_type_tmp == "SS4":
+                    print(f"[GET_DEVICES] 🚫 localhost:5559 已存在，隐藏 SS4 物理设备 {d.serial}")
+                    continue
             
             # 检查该设备是否已经被初始化为localhost:5559
             # 如果该serial作为original_serial存在于映射表中，说明已被初始化，跳过
@@ -835,17 +846,25 @@ def _adb_run(args: List[str], timeout: int = 10) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
 
-def ensure_accessibility_service(serial: str, apk_path: Optional[str] = None, install_if_missing: bool = True) -> Dict:
-    """Ensure CarUI accessibility service is installed, enabled and running.
+def ensure_accessibility_service(
+    serial: str,
+    apk_path: Optional[str] = None,
+    install_if_missing: bool = True,
+    *,
+    enable_service: bool = True,
+    probe_running: bool = True,
+) -> Dict:
+    """Ensure CarUI accessibility APK is installed, and optionally enabled/probed.
 
-    This is designed for 'one-click' UX:
-    - Optional install/update APK
-    - Enable service in secure settings (requires root / WRITE_SECURE_SETTINGS / userdebug)
-    - Forward 8765 and verify /api/status
+    Default行为保持原样（安装/启用/校验），以兼容现有“一键启动辅助服务”。
+
+    新增用法：连接设备时仅安装 APK（不改 secure settings，不做 8765 probe）：
+      ensure_accessibility_service(serial, enable_service=False, probe_running=False)
     """
     result: Dict = {
         "serial": serial,
         "target_serial": resolve_accessibility_target_serial(serial),
+        "install_serial": "",
         "apk_installed": None,
         "apk_install_attempted": False,
         "enabled": False,
@@ -854,7 +873,11 @@ def ensure_accessibility_service(serial: str, apk_path: Optional[str] = None, in
         "error": None,
     }
 
+    # 对 SS4 场景：可能同时存在 original_serial / localhost:5559。
+    # 为了让“仅安装 APK”也尽量成功，这里对候选 serial 做 best-effort 选择。
+    candidates = get_accessibility_candidate_serials(serial)
     target_serial = result["target_serial"]
+    install_serial = ""
 
     def step(msg: str):
         print(f"[Accessibility][Ensure] {msg}")
@@ -862,76 +885,114 @@ def ensure_accessibility_service(serial: str, apk_path: Optional[str] = None, in
 
     try:
         # 0) Validate adb device
-        step(f"Using target_serial={target_serial}")
+        step(f"Using target_serial={target_serial}, candidates={candidates}")
 
-        # 1) Check APK installed
+        # 1) Resolve APK path (bundled first)
+        if not apk_path:
+            bundled = os.path.join(script_dir, "CarUIAccessibilityService-debug.apk")
+            dev_path = os.path.abspath(
+                os.path.join(
+                    script_dir,
+                    "..",
+                    "accessibility_service",
+                    "build",
+                    "outputs",
+                    "apk",
+                    "debug",
+                    "CarUIAccessibilityService-debug.apk",
+                )
+            )
+            if os.path.exists(bundled):
+                apk_path = bundled
+            elif os.path.exists(dev_path):
+                apk_path = dev_path
+
+        # 2) Check/install APK (best-effort: try candidates in order)
         pkg = "com.carui.accessibility"
-        r = _adb_run(["adb", "-s", target_serial, "shell", "pm", "path", pkg], timeout=8)
-        installed = (r.returncode == 0) and ("package:" in (r.stdout or ""))
+        installed = False
+        last_pm_err = ""
+        for s in candidates:
+            r = _adb_run(["adb", "-s", s, "shell", "pm", "path", pkg], timeout=8)
+            if r.returncode == 0 and ("package:" in (r.stdout or "")):
+                installed = True
+                install_serial = s
+                step(f"APK already installed on {s}")
+                break
+            last_pm_err = (r.stderr or "").strip() or (r.stdout or "").strip()
+
         result["apk_installed"] = installed
+        result["install_serial"] = install_serial
         step(f"APK installed? {installed}")
 
-        # 2) Install if missing (or user provided path)
         if (not installed) and install_if_missing:
-            # If path not specified, try default build output relative to repo/plugin
-            if not apk_path:
-                # server/main.py is inside <plugin>/server
-                # Try to locate apk built by compile_apk.sh
-                candidate = os.path.abspath(os.path.join(script_dir, "..", "accessibility_service", "build", "outputs", "apk", "debug", "accessibility_service-debug.apk"))
-                if os.path.exists(candidate):
-                    apk_path = candidate
-
             if apk_path and os.path.exists(apk_path):
                 result["apk_install_attempted"] = True
                 step(f"Installing APK: {apk_path}")
-                ir = _adb_run(["adb", "-s", target_serial, "install", "-r", apk_path], timeout=90)
-                if ir.returncode != 0:
-                    step(f"APK install failed: {ir.stderr.strip()}")
+
+                # prefer target_serial first, then other candidates
+                install_try_serials = [target_serial] + [s for s in candidates if s != target_serial]
+                install_ok = False
+                last_install_err = ""
+                for s in install_try_serials:
+                    ir = _adb_run(["adb", "-s", s, "install", "-r", apk_path], timeout=90)
+                    if ir.returncode == 0:
+                        install_ok = True
+                        install_serial = s
+                        break
+                    last_install_err = (ir.stderr or "").strip() or (ir.stdout or "").strip()
+
+                if not install_ok:
+                    step(f"APK install failed: {last_install_err}")
                 else:
-                    step("APK install success")
+                    step(f"APK install success on {install_serial}")
                     result["apk_installed"] = True
+                    result["install_serial"] = install_serial
             else:
                 step("APK missing and no apk_path provided")
+                if last_pm_err:
+                    step(f"pm path last error: {last_pm_err}")
 
-        # 3) Enable secure settings (requires privileged environment)
-        # Read current services
-        r = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
-        current_services = (r.stdout or "").strip()
-        component = "com.carui.accessibility/.CarUIAccessibilityService"
-        if "com.carui.accessibility" in current_services:
-            step("Service already in enabled_accessibility_services")
+        # 3) Enable secure settings (optional)
+        if enable_service:
+            r = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
+            current_services = (r.stdout or "").strip()
+            component = "com.carui.accessibility/.CarUIAccessibilityService"
+            if "com.carui.accessibility" in current_services:
+                step("Service already in enabled_accessibility_services")
+            else:
+                new_services = (
+                    f"{current_services}:{component}" if current_services and current_services != "null" else component
+                )
+                step(f"Enabling service via secure settings: {component}")
+                _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services], timeout=6)
+
+            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+
+            enabled_services_now = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6).stdout.strip()
+            result["enabled"] = "com.carui.accessibility" in (enabled_services_now or "")
+            step(f"Enabled now? {result['enabled']}")
+            if not result["enabled"]:
+                step("WARNING: enable may require root/WRITE_SECURE_SETTINGS; please enable manually in Settings")
         else:
-            new_services = (
-                f"{current_services}:{component}" if current_services and current_services != "null" else component
-            )
-            step(f"Enabling service via secure settings: {component}")
-            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services], timeout=6)
+            step("Skip enabling service (enable_service=false)")
 
-        _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+        # 4) Probe running (optional)
+        if probe_running:
+            _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
 
-        # 4) Forward and probe running
-        _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
-
-        # Poll up to 4s
-        import time
-        enabled_services_now = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6).stdout.strip()
-        result["enabled"] = "com.carui.accessibility" in (enabled_services_now or "")
-
-        step(f"Enabled now? {result['enabled']}")
-
-        running = False
-        for i in range(1, 9):
-            if check_accessibility_service(target_serial):
-                running = True
-                break
-            time.sleep(0.5)
-        result["running"] = running
-        step(f"Running? {running}")
-
-        if not result["enabled"]:
-            step("WARNING: enable may require root/WRITE_SECURE_SETTINGS; please enable manually in Settings")
-        if not result["running"]:
-            step("WARNING: service not responding on 8765; please open Accessibility settings and toggle service")
+            import time
+            running = False
+            for _ in range(1, 9):
+                if check_accessibility_service(target_serial):
+                    running = True
+                    break
+                time.sleep(0.5)
+            result["running"] = running
+            step(f"Running? {running}")
+            if not result["running"]:
+                step("WARNING: service not responding on 8765; please open Accessibility settings and toggle service")
+        else:
+            step("Skip probing running status (probe_running=false)")
 
         return result
     except Exception as e:
@@ -1072,6 +1133,29 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
         traceback.print_exc()
         return None
 
+
+def pick_accessibility_probe_serial(serial: str) -> str:
+    """Pick the best serial for accessibility HTTP probe.
+
+    For SS4, current_serial may be localhost:5559, while the accessibility APK may
+    be running on the original physical serial (or vice versa).
+
+    We probe candidate serials and return the one that can successfully reach
+    http://localhost:8765/api/status after forwarding.
+    """
+    try:
+        probe = probe_accessibility_service_any(serial)
+        ok_serial = (probe or {}).get("ok_serial") or ""
+        if ok_serial:
+            return ok_serial
+    except Exception:
+        pass
+    # fallback: prefer shell-capable serial (for forward/settings)
+    try:
+        return pick_accessibility_shell_serial(serial)
+    except Exception:
+        return serial
+
 @app.get("/api/hierarchy")
 def get_hierarchy(display: int = 0, force_accessibility: bool = False):
     global current_serial
@@ -1086,7 +1170,8 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
     if force_accessibility:
         # 用户选择使用辅助服务
         print(f"[Hierarchy] 🔧 使用辅助服务模式")
-        target_serial = resolve_accessibility_target_serial(current_serial)
+        # 更稳健：SS4 场景下对候选 serial 逐个 probe，选能通 /api/status 的那个
+        target_serial = pick_accessibility_probe_serial(current_serial)
         if target_serial != current_serial:
             print(f"[Hierarchy] ♿ 辅助服务目标设备序列号修正: {current_serial} -> {target_serial}")
 
@@ -1684,6 +1769,8 @@ class EnsureAccessibilityRequest(BaseModel):
     serial: Optional[str] = None
     apk_path: Optional[str] = None
     install_if_missing: bool = True
+    enable_service: bool = True
+    probe_running: bool = True
 
 
 @app.post("/api/accessibility/ensure")
@@ -1696,7 +1783,13 @@ def api_ensure_accessibility(req: EnsureAccessibilityRequest):
     serial = req.serial or current_serial
     if not serial:
         raise HTTPException(status_code=400, detail="Device not connected")
-    return ensure_accessibility_service(serial, apk_path=req.apk_path, install_if_missing=req.install_if_missing)
+    return ensure_accessibility_service(
+        serial,
+        apk_path=req.apk_path,
+        install_if_missing=req.install_if_missing,
+        enable_service=req.enable_service,
+        probe_running=req.probe_running,
+    )
 
 @app.post("/api/accessibility/disable")
 def disable_accessibility_service():

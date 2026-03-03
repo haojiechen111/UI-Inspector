@@ -19,14 +19,14 @@
 1. 用Android Studio打开此目录
 2. 等待Gradle同步完成
 3. 点击 Build → Build Bundle(s) / APK(s) → Build APK(s)
-4. APK输出路径：`build/outputs/apk/debug/accessibility_service-debug.apk`
+4. APK输出路径：`build/outputs/apk/debug/CarUIAccessibilityService-debug.apk`
 
 ### 方式2：使用命令行
 
 ```bash
 cd accessibility_service
 ./gradlew assembleDebug
-# APK位置: build/outputs/apk/debug/accessibility_service-debug.apk
+# APK位置: build/outputs/apk/debug/CarUIAccessibilityService-debug.apk
 ```
 
 ## 📦 安装步骤
@@ -34,7 +34,7 @@ cd accessibility_service
 ### 1. 安装APK到设备
 
 ```bash
-adb install -r accessibility_service-debug.apk
+adb install -r CarUIAccessibilityService-debug.apk
 ```
 
 ### 2. 启用辅助服务

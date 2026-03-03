@@ -88,5 +88,15 @@ tasks {
         from("server") {
             into("${intellij.pluginName.get()}/server")
         }
+        
+        // 将辅助服务APK打包到插件中（以便用户无需源码也能安装）
+        val apkPath = "accessibility_service/build/outputs/apk/debug/CarUIAccessibilityService-debug.apk"
+        if (file(apkPath).exists()) {
+            from(apkPath) {
+                into("${intellij.pluginName.get()}/server")
+            }
+        } else {
+            println("⚠️ Warning: APK not found at $apkPath. Plugin will be built without bundled APK.")
+        }
     }
 }

@@ -38,9 +38,10 @@
             </div>
             <div class="control-group">
                 <label class="toggle-switch" title="选择数据源：UIAutomator或辅助服务" style="margin-right: 10px;">
-                    <input type="checkbox" id="useAccessibilityService">
+                    <!-- 默认使用辅助服务；用户手动关闭后才走 UIAutomator -->
+                    <input type="checkbox" id="useAccessibilityService" checked>
                     <span class="slider"></span>
-                    <span class="label-text" id="dataSourceLabel">UIAutomator</span>
+                    <span class="label-text" id="dataSourceLabel">辅助服务</span>
                 </label>
             </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
@@ -193,7 +194,8 @@
         </div>
     </div>
 
-    <script src="app.js?v=10"></script>
+    <!-- bump version to avoid JCEF cache -->
+    <script src="app.js?v=12"></script>
 </body>
 
 </html>
