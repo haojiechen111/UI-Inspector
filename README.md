@@ -1,48 +1,84 @@
 # Car UI Inspector - Android Studio Plugin
 
-This is the Android Studio implementation of the Car UI Inspector tool.
+Car UI Inspector 是一个 Android Studio 插件，用于车机 UI 的实时可视化调试、节点查看与点击联动。
+
+> ✅ 从 2026.03 起，本项目已增强“新手可用性”：
+> - 插件内置更详细的环境检测（Python / pip / ADB）
+> - 缺依赖时给出可直接复制的命令
+> - Web UI 新增“新手快速开始”与“安装指南”面板
+> - 构建流程兼容更多 JDK 发行版（避免 `instrumentCode .../Packages does not exist`）
+
+## 0. 给纯小白的 5 分钟上手
+
+### 第一步：准备电脑环境
+1. 安装 **Android Studio**（建议 2024.1+）
+2. 安装 **Python 3.7+**（建议 3.10+）
+3. 安装 **ADB (Android Platform-Tools)**
+
+### 第二步：安装 Python 依赖
+
+在项目根目录执行（推荐）：
+
+```bash
+# macOS / Linux
+python3 -m pip install -r server/requirements.txt
+
+# Windows
+python -m pip install -r server/requirements.txt
+```
+
+### 第三步：验证 ADB
+
+```bash
+adb version
+adb devices
+```
+
+如果 `adb` 命令找不到：
+- 在 Android Studio → `SDK Manager` 安装 `Android SDK Platform-Tools`
+- 把 `platform-tools` 目录加入 PATH
+
+### 第四步：安装插件包
+1. 用 Android Studio 打开本项目
+2. 执行 `buildPlugin`
+3. 在 `build/distributions/` 找到 zip
+4. Android Studio → `Settings/Preferences` → `Plugins` → ⚙ → `Install Plugin from Disk...`
+
+---
 
 ## Prerequisites
-- Android Studio (Flamingo or newer recommended)
-- JDK 17
-- Python 3.7+ (支持 Windows, macOS, Linux/Ubuntu)
-- Python 依赖包: `fastapi`, `uvicorn`, `adbutils`, `pillow`
+- Android Studio（Flamingo+，推荐 2024.1+）
+- JDK 17（推荐 Android Studio 自带 JBR）
+- Python 3.7+（Windows/macOS/Linux）
+- ADB（Android Platform-Tools）
 
-### 依赖安装（跨平台）
+## 1. Python 依赖安装（跨平台）
 
-插件会自动检测 Python 环境和依赖包，如果缺少依赖，会显示针对您操作系统的安装命令。
+插件会自动检测 Python / pip / ADB。如果缺失，会在插件内给出详细修复建议。
 
-**Windows:**
+**Windows：**
 ```bash
-pip install -r server/requirements.txt
-# 或单独安装
-pip install fastapi uvicorn adbutils pillow
+python -m pip install -r server/requirements.txt
 ```
 
-**macOS:**
+**macOS：**
 ```bash
-pip3 install -r server/requirements.txt
-# 或单独安装
-pip3 install fastapi uvicorn adbutils pillow
+python3 -m pip install -r server/requirements.txt
 ```
 
-**Ubuntu/Debian:**
+**Ubuntu/Debian：**
 ```bash
-# 首先确保安装了 Python 和 pip
-sudo apt update && sudo apt install python3 python3-pip
-# 然后安装依赖
-pip3 install -r server/requirements.txt
+sudo apt update && sudo apt install python3 python3-pip android-sdk-platform-tools
+python3 -m pip install -r server/requirements.txt
 ```
 
-**CentOS/RHEL:**
+**CentOS/RHEL：**
 ```bash
-# 首先确保安装了 Python 和 pip
-sudo yum install python3 python3-pip
-# 然后安装依赖
-pip3 install -r server/requirements.txt
+sudo yum install python3 python3-pip android-tools
+python3 -m pip install -r server/requirements.txt
 ```
 
-## How to Build & Install
+## 2. How to Build & Install
 
 ### 方法1：在 Android Studio 中编译（推荐）✨
 
@@ -56,6 +92,9 @@ pip3 install -r server/requirements.txt
 2. **等待 Gradle 同步**
    - Android Studio 会自动下载 Gradle 并同步项目
    - 等待右下角的同步进度完成
+
+   > 建议：`Settings > Build, Execution, Deployment > Build Tools > Gradle`
+   > 将 `Gradle JDK` 设为 **Embedded JDK (JBR 17+)**
 
 3. **编译插件**
    
@@ -90,21 +129,18 @@ pip3 install -r server/requirements.txt
 # 1. 进入项目目录
 cd /path/to/UI-Inspector
 
-# 2a. 如果有 gradlew（推荐）
-./gradlew buildPlugin
+# 2. 推荐使用 JDK17/JBR
+JAVA_HOME="/path/to/jdk17-or-android-studio-jbr" ./gradlew buildPlugin --no-daemon --console=plain
 
-# 2b. 如果没有 gradlew，先生成 wrapper
-gradle wrapper
-./gradlew buildPlugin
-
-# 2c. 或直接使用系统 gradle
-gradle buildPlugin
-
-# 3. 编译产物在
+# 3. 编译产物
 ls -la build/distributions/
 ```
 
-### 环境问题排查
+### 环境问题排查（高频）
+
+**问题0：`instrumentCode .../Packages does not exist`**
+
+已在本项目中做兼容处理（默认禁用 `instrumentCode`），用于提升不同 JDK 发行版下的构建成功率。
 
 **问题1：`gradle: command not found`**
 ```bash
@@ -133,6 +169,17 @@ bash --noprofile --norc
 cd /path/to/UI-Inspector
 gradle buildPlugin
 ```
+
+**问题4：`adb: command not found`**
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install android-sdk-platform-tools
+
+# macOS
+brew install android-platform-tools
+```
+
+并确认 `adb version` 可执行。
 
 ## Features
 - Real-time Car UI mirroring in a Tool Window.

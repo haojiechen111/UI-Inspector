@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>车载 UI 工具</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=8">
+    <link rel="stylesheet" href="style.css?v=9">
 </head>
 
 <body>
@@ -46,8 +46,24 @@
             </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
             <span id="status" class="status-badge">未连接</span>
+            <button class="btn-icon" onclick="showHelpModal()" title="新手安装与使用指南">📘</button>
             <button class="btn-icon" onclick="showSettingsModal()" title="搜索高亮设置">🔍</button>
             <!-- 已移除“重启服务/硬清空”按钮：推荐通过关闭/重开 ToolWindow 触发重置 -->
+        </div>
+    </div>
+
+    <div id="quickStartBanner" class="quick-start-banner">
+        <div class="quick-start-left">
+            <div class="quick-start-title">🚀 新手快速开始</div>
+            <div class="quick-start-steps">
+                <span class="step-chip">1. 安装 Python3 + ADB</span>
+                <span class="step-chip">2. 连接设备并开启开发者模式</span>
+                <span class="step-chip">3. 点击「连接设备」开始调试</span>
+            </div>
+        </div>
+        <div class="quick-start-actions">
+            <button class="btn-secondary" onclick="showHelpModal()">查看完整指南</button>
+            <button class="btn-icon" onclick="dismissQuickStartBanner()" title="关闭提示">✕</button>
         </div>
     </div>
 
@@ -194,8 +210,60 @@
         </div>
     </div>
 
+    <!-- Help Modal -->
+    <div id="helpModal" class="modal" onclick="closeHelpModal(event)">
+        <div class="modal-content help-modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📘 新手安装与使用指南</h3>
+                <button class="modal-close" onclick="closeHelpModal()">×</button>
+            </div>
+            <div class="modal-body help-body">
+                <div class="help-section">
+                    <h4>一、电脑端必备依赖</h4>
+                    <ul>
+                        <li>Android Studio（建议 2024.1+）</li>
+                        <li>Python 3.7+（建议 3.10+）</li>
+                        <li>ADB（Android Platform-Tools）</li>
+                    </ul>
+                </div>
+
+                <div class="help-section">
+                    <h4>二、Python 依赖安装</h4>
+                    <div class="help-command-block">
+                        <div class="help-command-label">macOS / Linux</div>
+                        <code id="helpCmdPipUnix">python3 -m pip install -r server/requirements.txt</code>
+                        <button class="btn-secondary btn-copy" onclick="copyCommand('helpCmdPipUnix')">复制命令</button>
+                    </div>
+                    <div class="help-command-block">
+                        <div class="help-command-label">Windows</div>
+                        <code id="helpCmdPipWin">python -m pip install -r server/requirements.txt</code>
+                        <button class="btn-secondary btn-copy" onclick="copyCommand('helpCmdPipWin')">复制命令</button>
+                    </div>
+                </div>
+
+                <div class="help-section">
+                    <h4>三、ADB 快速检查</h4>
+                    <div class="help-command-block">
+                        <code id="helpCmdAdbCheck">adb version && adb devices</code>
+                        <button class="btn-secondary btn-copy" onclick="copyCommand('helpCmdAdbCheck')">复制命令</button>
+                    </div>
+                    <p class="help-tip">如果提示找不到 adb：请在 Android Studio > SDK Manager 安装 Platform-Tools，并把 platform-tools 加入 PATH。</p>
+                </div>
+
+                <div class="help-section">
+                    <h4>四、设备连接前检查</h4>
+                    <ul>
+                        <li>设备已开启开发者选项 + USB 调试</li>
+                        <li>首次连接已在设备上点“允许 USB 调试”</li>
+                        <li>执行 <code>adb devices</code> 能看到 <code>device</code> 状态</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- bump version to avoid JCEF cache -->
-    <script src="app.js?v=12"></script>
+    <script src="app.js?v=13"></script>
 </body>
 
 </html>

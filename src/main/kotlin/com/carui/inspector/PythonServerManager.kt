@@ -19,6 +19,14 @@ data class DependencyCheckResult(
     val osName: String?,   // 详细的操作系统信息
     val pipCmd: String?,  // 可用的 pip 命令
     val pipMethods: List<String>,  // 所有可用的 pip 安装方法
+    val pipOk: Boolean,
+    val adbOk: Boolean,
+    val adbPath: String?,
+    val adbVersion: String?,
+    val adbError: String?,
+    val adbCandidates: List<String>,
+    val installAllCmd: String?,
+    val recommendations: List<String>,
     val sysPath: List<String>  // Python sys.path，用于诊断
 )
 
@@ -103,6 +111,14 @@ object PythonServerManager {
                 osName = null,
                 pipCmd = null,
                 pipMethods = emptyList(),
+                pipOk = true,
+                adbOk = true,
+                adbPath = null,
+                adbVersion = null,
+                adbError = null,
+                adbCandidates = emptyList(),
+                installAllCmd = null,
+                recommendations = emptyList(),
                 sysPath = emptyList()
             )
         }
@@ -139,6 +155,14 @@ object PythonServerManager {
                     osName = null,
                     pipCmd = null,
                     pipMethods = emptyList(),
+                    pipOk = false,
+                    adbOk = false,
+                    adbPath = null,
+                    adbVersion = null,
+                    adbError = null,
+                    adbCandidates = emptyList(),
+                    installAllCmd = null,
+                    recommendations = listOf("请先安装 Python 3.7+ 并配置 PATH", "请确认 Android Platform-Tools(adb) 已安装并配置 PATH"),
                     sysPath = emptyList()
                 )
             }
@@ -158,46 +182,48 @@ object PythonServerManager {
                     // 简单的JSON解析
                     val allOk = output.contains("\"all_ok\": true")
                     val pythonOk = output.contains("\"python_ok\": true")
+                    val pipOk = output.contains("\"pip_ok\": true")
+                    val adbOk = output.contains("\"adb_ok\": true")
+
+                    fun parseJsonString(key: String): String? {
+                        val match = Regex("\"$key\":\\s*\"([^\"]*)\"").find(output)
+                        return match?.groupValues?.get(1)
+                    }
+
+                    fun parseJsonStringArray(key: String): List<String> {
+                        val list = mutableListOf<String>()
+                        val match = Regex("\"$key\":\\s*\\[([^\\]]*)\\]").find(output) ?: return list
+                        val raw = match.groupValues[1]
+                        Regex("\"([^\"]+)\"").findAll(raw).forEach { m ->
+                            list.add(m.groupValues[1])
+                        }
+                        return list
+                    }
                     
                     // 提取Python版本（使用完整版本号）
-                    val pythonVersion = Regex("\"python_version\":\\s*\"([^\"]+)\"")
-                        .find(output)?.groupValues?.get(1) ?: "unknown"
+                    val pythonVersion = parseJsonString("python_version") ?: "unknown"
                     
                     // 提取使用 python --version 获取的版本
-                    val pythonVersionFromCmd = Regex("\"python_version_from_cmd\":\\s*\"([^\"]+)\"")
-                        .find(output)?.groupValues?.get(1)
+                    val pythonVersionFromCmd = parseJsonString("python_version_from_cmd")
                     
                     // 提取OS信息
-                    val osType = Regex("\"os_type\":\\s*\"([^\"]+)\"")
-                        .find(output)?.groupValues?.get(1)
-                    val osName = Regex("\"os_name\":\\s*\"([^\"]+)\"")
-                        .find(output)?.groupValues?.get(1)
+                    val osType = parseJsonString("os_type")
+                    val osName = parseJsonString("os_name")
                     
                     // 提取 pip 命令信息
-                    val pipCmd = Regex("\"pip_cmd\":\\s*\"([^\"]+)\"")
-                        .find(output)?.groupValues?.get(1)
+                    val pipCmd = parseJsonString("pip_cmd")
+                    val installAllCmd = parseJsonString("install_all_cmd")
+                    val adbPath = parseJsonString("adb_path")
+                    val adbVersion = parseJsonString("adb_version")
+                    val adbError = parseJsonString("adb_error")
                     
                     // 提取所有可用的 pip 方法
-                    val pipMethods = mutableListOf<String>()
-                    val pipMethodsPattern = Regex("\"pip_methods\":\\s*\\[([^\\]]+)\\]")
-                    val pipMethodsMatch = pipMethodsPattern.find(output)
-                    if (pipMethodsMatch != null) {
-                        val methodsStr = pipMethodsMatch.groupValues[1]
-                        Regex("\"([^\"]+)\"").findAll(methodsStr).forEach { match ->
-                            pipMethods.add(match.groupValues[1])
-                        }
-                    }
+                    val pipMethods = parseJsonStringArray("pip_methods")
+                    val adbCandidates = parseJsonStringArray("adb_candidates")
+                    val recommendations = parseJsonStringArray("recommendations")
                     
                     // 提取 sys.path（用于诊断）
-                    val sysPath = mutableListOf<String>()
-                    val sysPathPattern = Regex("\"sys_path\":\\s*\\[([^\\]]+)\\]")
-                    val sysPathMatch = sysPathPattern.find(output)
-                    if (sysPathMatch != null) {
-                        val pathsStr = sysPathMatch.groupValues[1]
-                        Regex("\"([^\"]+)\"").findAll(pathsStr).forEach { match ->
-                            sysPath.add(match.groupValues[1])
-                        }
-                    }
+                    val sysPath = parseJsonStringArray("sys_path")
                     
                     // 提取缺失的包及其安装命令
                     val missingPackages = mutableListOf<String>()
@@ -228,53 +254,31 @@ object PythonServerManager {
                         }
                     }
                     
-                    // 优先使用从 Python 脚本检测到的 pip 命令，否则根据OS类型生成
-                    val pipCommand = pipCmd ?: when (osType) {
-                        "Windows" -> "pip"
-                        "Darwin" -> "pip3"  // macOS
-                        else -> "pip3"  // Linux/Ubuntu
-                    }
-                    
                     val errorMsg = if (!allOk) {
                         buildString {
+                            append("检测到本机环境未就绪，请按以下提示处理：\n")
+
                             if (!pythonOk) {
-                                append("Python版本过低（需要3.7+，当前：$pythonVersion）\n")
+                                append("• Python版本过低（需要3.7+，当前：$pythonVersion）\n")
+                            }
+                            if (!adbOk) {
+                                append("• 未检测到可用 ADB（Android Platform-Tools）\n")
+                                adbError?.takeIf { it.isNotBlank() }?.let { append("  - ADB错误: $it\n") }
+                                if (adbCandidates.isNotEmpty()) {
+                                    append("  - 检测到可能的ADB路径: ${adbCandidates.joinToString(", ")}\n")
+                                }
                             }
                             if (missingPackages.isNotEmpty()) {
-                                append("缺少依赖包：${missingPackages.joinToString(", ")}\n\n")
-                                
-                                // 根据不同系统提供不同的安装指引
-                                when (osType) {
-                                    "Windows" -> {
-                                        append("Windows安装命令：\n")
-                                        append("$pipCommand install ${missingPackages.joinToString(" ")}\n\n")
-                                        append("如果pip不可用，请先安装Python 3.7+：\n")
-                                        append("https://www.python.org/downloads/")
-                                    }
-                                    "Darwin" -> {
-                                        append("macOS安装命令：\n")
-                                        append("$pipCommand install ${missingPackages.joinToString(" ")}\n\n")
-                                        append("如果未安装Python，推荐使用Homebrew安装：\n")
-                                        append("brew install python3")
-                                    }
-                                    "Linux" -> {
-                                        val distro = osName?.lowercase() ?: ""
-                                        if (distro.contains("ubuntu") || distro.contains("debian")) {
-                                            append("Ubuntu/Debian安装命令：\n")
-                                            append("sudo apt update && sudo apt install python3 python3-pip\n")
-                                            append("$pipCommand install ${missingPackages.joinToString(" ")}")
-                                        } else {
-                                            append("Linux安装命令：\n")
-                                            append("$pipCommand install ${missingPackages.joinToString(" ")}\n\n")
-                                            append("如果pip3不可用，请使用包管理器安装：\n")
-                                            append("sudo yum install python3-pip  # CentOS/RHEL\n")
-                                            append("sudo apt install python3-pip   # Ubuntu/Debian")
-                                        }
-                                    }
-                                    else -> {
-                                        append("安装命令：\n")
-                                        append("$pipCommand install ${missingPackages.joinToString(" ")}")
-                                    }
+                                append("• 缺少Python依赖包: ${missingPackages.joinToString(", ")}\n")
+                                installAllCmd?.let {
+                                    append("  - 一键安装命令: $it\n")
+                                }
+                            }
+
+                            if (recommendations.isNotEmpty()) {
+                                append("\n建议操作：\n")
+                                recommendations.forEachIndexed { idx, tip ->
+                                    append("${idx + 1}. $tip\n")
                                 }
                             }
                         }
@@ -292,6 +296,14 @@ object PythonServerManager {
                         osName = osName,
                         pipCmd = pipCmd,
                         pipMethods = pipMethods,
+                        pipOk = pipOk,
+                        adbOk = adbOk,
+                        adbPath = adbPath,
+                        adbVersion = adbVersion,
+                        adbError = adbError,
+                        adbCandidates = adbCandidates,
+                        installAllCmd = installAllCmd,
+                        recommendations = recommendations,
                         sysPath = sysPath
                     )
                     lastCheckResult = result
@@ -311,6 +323,14 @@ object PythonServerManager {
                         osName = null,
                         pipCmd = null,
                         pipMethods = emptyList(),
+                        pipOk = false,
+                        adbOk = false,
+                        adbPath = null,
+                        adbVersion = null,
+                        adbError = null,
+                        adbCandidates = emptyList(),
+                        installAllCmd = null,
+                        recommendations = emptyList(),
                         sysPath = emptyList()
                     )
                 }
@@ -328,6 +348,14 @@ object PythonServerManager {
                     osName = null,
                     pipCmd = null,
                     pipMethods = emptyList(),
+                    pipOk = false,
+                    adbOk = false,
+                    adbPath = null,
+                    adbVersion = null,
+                    adbError = null,
+                    adbCandidates = emptyList(),
+                    installAllCmd = null,
+                    recommendations = emptyList(),
                     sysPath = emptyList()
                 )
             }
@@ -345,6 +373,14 @@ object PythonServerManager {
             osName = null,
             pipCmd = null,
             pipMethods = emptyList(),
+            pipOk = false,
+            adbOk = false,
+            adbPath = null,
+            adbVersion = null,
+            adbError = null,
+            adbCandidates = emptyList(),
+            installAllCmd = null,
+            recommendations = emptyList(),
             sysPath = emptyList()
         )
     }

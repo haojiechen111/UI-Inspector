@@ -115,6 +115,85 @@ function showSettingsModal() {
     document.getElementById('ignoreCase').checked = searchSettings.ignoreCase;
 }
 
+function showHelpModal() {
+    const modal = document.getElementById('helpModal');
+    if (modal) modal.classList.add('show');
+}
+
+function closeHelpModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = document.getElementById('helpModal');
+    if (modal) modal.classList.remove('show');
+}
+
+function copyCommand(elementId) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    const text = (el.innerText || el.textContent || '').trim();
+    if (!text) return;
+
+    const onSuccess = () => {
+        addLogEntry(`📋 已复制命令: ${text}`, 'success');
+        showToast();
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+            // fallback below
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+                onSuccess();
+            } catch (e) {
+                addLogEntry(`⚠️ 复制失败，请手动复制: ${text}`, 'warning');
+                showToast();
+            }
+        });
+    } else {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+            onSuccess();
+        } catch (e) {
+            addLogEntry(`⚠️ 复制失败，请手动复制: ${text}`, 'warning');
+            showToast();
+        }
+    }
+}
+
+function dismissQuickStartBanner() {
+    const banner = document.getElementById('quickStartBanner');
+    if (banner) {
+        banner.classList.add('hidden');
+    }
+    try {
+        localStorage.setItem('uiInspectorQuickStartDismissed', '1');
+    } catch (_) {}
+}
+
+function initQuickStartBanner() {
+    const banner = document.getElementById('quickStartBanner');
+    if (!banner) return;
+    try {
+        const dismissed = localStorage.getItem('uiInspectorQuickStartDismissed') === '1';
+        if (dismissed) {
+            banner.classList.add('hidden');
+        }
+    } catch (_) {}
+}
+
 // 模式列表管理函数 - 每个关键字独立配色
 function addPattern() {
     const input = document.getElementById('newPattern');
@@ -662,6 +741,7 @@ function disableDisplaySelector() {
 // Init
 window.onload = () => {
     loadSettings(); // Load settings from localStorage
+    initQuickStartBanner();
     disableDisplaySelector(); // 初始化时禁用display选择器
     refreshDeviceList(); // 只加载设备列表，不自动连接
     
@@ -742,6 +822,36 @@ function addLogEntry(message, type = 'info') {
 function clearLog() {
     const logContainer = document.getElementById('toastLog');
     logContainer.innerHTML = '';
+}
+
+// ---- networking helpers ----
+// fetch with timeout to avoid "forever pending" in JCEF
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        return res;
+    } finally {
+        clearTimeout(id);
+    }
+}
+
+function formatMs(ms) {
+    if (ms == null || Number.isNaN(ms)) return '';
+    return `${Math.round(ms)}ms`;
+}
+
+function runInBackground(label, fn) {
+    Promise.resolve()
+        .then(fn)
+        .catch(e => {
+            console.warn(`[BG][${label}] failed`, e);
+            addLogEntry(`⚠️ ${label}失败: ${e.message || e}`, 'warning');
+        });
 }
 
 async function refreshDeviceList(autoConnect = false) {
@@ -945,20 +1055,16 @@ async function connectDevice() {
             addLogEntry(`✅ 普通Android设备，直接连接`, 'info');
         }
         
-        // Step 2: Refresh display list (保持用户选择的display)
-        console.log("[ConnectDevice] 刷新显示列表...");
-        addLogEntry(`🖥️ 检测显示屏幕...`, 'info');
-        await refreshDisplayList(true); // true = 保持用户当前选择的display
-
-        // Step 3: Connect to the device
+        // Step 2: Connect to the device FIRST (fast path)
         console.log(`[ConnectDevice] 连接到设备: ${targetSerial}`);
         addLogEntry(`🔌 正在建立连接...`, 'info');
-        
-        const res = await fetch('/api/connect', {
+
+        const tConnectStart = performance.now();
+        const res = await fetchWithTimeout('/api/connect', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ serial: targetSerial })
-        });
+        }, 8000);
         console.log(`[ConnectDevice] 连接API响应状态: ${res.status}`);
         
         if (!res.ok) {
@@ -969,6 +1075,7 @@ async function connectDevice() {
         }
         
         const data = await res.json();
+        addLogEntry(`⏱️ 连接耗时: ${formatMs(performance.now() - tConnectStart)}`, 'info');
         console.log("[ConnectDevice] 连接成功，设备信息:", data);
         const productName = data.info.productName || "Unknown Device";
         const statusEl = document.getElementById('status');
@@ -982,11 +1089,19 @@ async function connectDevice() {
         
         addLogEntry(`✅ 连接成功: ${productName}`, 'success');
 
-        // Step 3.5: Always ensure accessibility APK is installed (no manual install required).
-        // This does NOT enable accessibility or probe 8765; it only installs if missing.
-        try {
+        // Step 3: Refresh display list in BACKGROUND (do not block connection)
+        runInBackground('获取显示屏幕', async () => {
+            console.log("[ConnectDevice] (BG) 刷新显示列表...");
+            addLogEntry(`🖥️ 检测显示屏幕...`, 'info');
+            // keep user selection; if it takes too long, user can still work with default display
+            await refreshDisplayList(true);
+        });
+
+        // Step 3.5: Ensure accessibility APK in BACKGROUND (avoid blocking connection)
+        runInBackground('自动安装无障碍APK', async () => {
+            const tStart = performance.now();
             addLogEntry('📦 检查/安装 CarUI 无障碍APK（自动）...', 'info');
-            const ensureApkRes = await fetch('/api/accessibility/ensure', {
+            const ensureApkRes = await fetchWithTimeout('/api/accessibility/ensure', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -995,12 +1110,13 @@ async function connectDevice() {
                     enable_service: false,
                     probe_running: false
                 })
-            });
+            }, 60000);
             if (ensureApkRes.ok) {
                 const ensureApkData = await ensureApkRes.json();
                 if (ensureApkData && Array.isArray(ensureApkData.steps)) {
                     ensureApkData.steps.forEach(s => addLogEntry(`📦 ${s}`, 'info'));
                 }
+                addLogEntry(`⏱️ APK检查/安装耗时: ${formatMs(performance.now() - tStart)}`, 'info');
                 if (ensureApkData.apk_installed) {
                     addLogEntry('✅ 无障碍APK已就绪（已安装或已自动安装）', 'success');
                 } else {
@@ -1010,9 +1126,7 @@ async function connectDevice() {
                 const errText = await ensureApkRes.text();
                 addLogEntry(`⚠️ 自动安装APK失败: ${errText}`, 'warning');
             }
-        } catch (e) {
-            addLogEntry(`⚠️ 自动安装APK异常: ${e.message}`, 'warning');
-        }
+        });
 
         // Step 4: If user selected accessibility mode, prefer "status check" first.
         // If already running, don't touch secure settings (fits your "我肯定会打开" usage).
@@ -1024,7 +1138,7 @@ async function connectDevice() {
                     addLogEntry('✅ 辅助服务已在运行（跳过一键启用）', 'success');
                 } else {
                     addLogEntry('♿ 一键启动辅助服务（安装/启用/校验）...', 'info');
-                    const ensureRes = await fetch('/api/accessibility/ensure', {
+                    const ensureRes = await fetchWithTimeout('/api/accessibility/ensure', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1033,7 +1147,7 @@ async function connectDevice() {
                             enable_service: true,
                             probe_running: true
                         })
-                    });
+                    }, 60000);
 
                     if (ensureRes.ok) {
                         const ensureData = await ensureRes.json();

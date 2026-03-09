@@ -65,104 +65,74 @@ class CarUiToolWindowFactory : ToolWindowFactory {
                 if (!checkResult.success) {
                     // 依赖检查失败，显示详细错误
                     javax.swing.SwingUtilities.invokeLater {
+                        val pythonVersion = checkResult.pythonVersionFromCmd
+                            ?: checkResult.pythonVersion
+                            ?: "unknown"
+
                         val errorHtml = buildErrorHtml(
                             title = "环境检查失败",
                             message = checkResult.errorMessage ?: "未知错误",
                             details = buildString {
-                                // 显示Python版本信息
-                                checkResult.pythonVersionFromCmd?.let {
-                                    append("<strong>Python版本:</strong> $it<br>")
-                                } ?: checkResult.pythonVersion?.let {
-                                    append("<strong>Python版本:</strong> $it<br>")
+                                append("<div style='display:grid; gap:8px;'>")
+                                append("<div style='background:#111827; border:1px solid #374151; border-radius:8px; padding:10px 12px;'>")
+                                append("<strong style='color:#93c5fd;'>环境摘要</strong><br>")
+                                append("Python: <code>${escapeHtml(pythonVersion)}</code><br>")
+                                append("PIP: ${if (checkResult.pipOk) "✅ 可用" else "❌ 不可用"}")
+                                if (checkResult.pipMethods.isNotEmpty()) {
+                                    append("（${escapeHtml(checkResult.pipMethods.joinToString(", "))}）")
+                                }
+                                append("<br>")
+                                append("ADB: ${if (checkResult.adbOk) "✅ 可用" else "❌ 不可用"}")
+                                checkResult.adbVersion?.let {
+                                    append("（${escapeHtml(it)}）")
+                                }
+                                checkResult.adbPath?.let {
+                                    append("<br>ADB路径: <code>${escapeHtml(it)}</code>")
+                                }
+                                append("</div>")
+
+                                if (checkResult.recommendations.isNotEmpty()) {
+                                    append("<div style='background:#1f2937; border:1px solid #374151; border-radius:8px; padding:10px 12px;'>")
+                                    append("<strong style='color:#fcd34d;'>建议操作</strong><ol style='margin:8px 0 0 18px; padding:0;'>")
+                                    checkResult.recommendations.forEach { tip ->
+                                        append("<li>${escapeHtml(tip)}</li>")
+                                    }
+                                    append("</ol></div>")
                                 }
 
-                                // 显示操作系统信息
-                                checkResult.osType?.let {
-                                    append("<strong>操作系统:</strong> $it<br>")
-                                }
-
-                                // 如果没有检测到缺失的包，但检查失败，显示手动安装所有依赖的命令
-                                if (checkResult.missingPackages.isEmpty() && !checkResult.success) {
-                                    append("<br><div style='background:#422006; border-left:3px solid #f59e0b; padding:12px; margin:10px 0;'>")
-                                    append("<strong style='color:#fbbf24;'>⚠️ 无法确定缺少的具体依赖</strong><br>")
-                                    append("<span style='color:#fcd34d; font-size:13px;'>")
-                                    append("建议手动安装所有依赖包：")
-                                    append("</span>")
+                                checkResult.installAllCmd?.let { cmd ->
+                                    append("<div style='background:#2d2d2d; padding:12px; border-radius:8px; border:1px solid #3f3f46;'>")
+                                    append("<strong>一键安装 Python 依赖：</strong>")
+                                    append("<code style='display:block; color:#10b981; margin-top:8px; font-size:13px;'>${escapeHtml(cmd)}</code>")
                                     append("</div>")
+                                }
 
-                                    append("<div style='background:#2d2d2d; padding:12px; border-radius:4px; margin-top:10px; text-align:left;'>")
-                                    append("<strong>推荐安装命令（请在终端中执行）：</strong><br>")
+                                if (checkResult.missingPackagesWithCmd.isNotEmpty()) {
+                                    append("<div style='background:#2d2d2d; padding:12px; border-radius:8px; border:1px solid #3f3f46;'>")
+                                    append("<strong>逐条安装命令：</strong>")
+                                    checkResult.missingPackagesWithCmd.forEach { (_, cmd) ->
+                                        append("<code style='display:block; color:#10b981; margin:6px 0; font-size:13px;'>${escapeHtml(cmd)}</code>")
+                                    }
+                                    append("</div>")
+                                }
 
+                                if (!checkResult.adbOk) {
+                                    append("<div style='background:#422006; border-left:3px solid #f59e0b; padding:12px; margin-top:6px;'>")
+                                    append("<strong style='color:#fbbf24;'>ADB 未就绪</strong><br>")
+                                    append("<span style='color:#fde68a;'>请安装 Android Platform-Tools 并加入 PATH。</span><br>")
                                     when (checkResult.osType) {
-                                        "Darwin" -> {
-                                            // macOS
-                                            append("<code style='display:block; color:#10b981; margin:8px 0; font-size:13px;'>")
-                                            append("python3 -m pip install fastapi uvicorn adbutils pillow urllib3")
-                                            append("</code>")
-                                            append("<br><small style='color:#888;'>")
-                                            append("如果上述命令失败，请尝试：<br>")
-                                            append("<code style='color:#60a5fa;'>python -m pip install fastapi uvicorn adbutils pillow urllib3</code><br>")
-                                            append("或者：<code style='color:#60a5fa;'>pip3 install fastapi uvicorn adbutils pillow urllib3</code>")
-                                            append("</small>")
-                                        }
-                                        "Windows" -> {
-                                            append("<code style='display:block; color:#10b981; margin:8px 0; font-size:13px;'>")
-                                            append("python -m pip install fastapi uvicorn adbutils pillow urllib3")
-                                            append("</code>")
-                                        }
-                                        else -> {
-                                            // Linux
-                                            append("<code style='display:block; color:#10b981; margin:8px 0; font-size:13px;'>")
-                                            append("python3 -m pip install fastapi uvicorn adbutils pillow urllib3")
-                                            append("</code>")
-                                        }
+                                        "Darwin" -> append("<code style='display:block; color:#10b981; margin-top:8px;'>brew install android-platform-tools</code>")
+                                        "Windows" -> append("<span style='color:#fde68a;'>可在 Android Studio > SDK Manager 安装 Platform-Tools。</span>")
+                                        else -> append("<code style='display:block; color:#10b981; margin-top:8px;'>sudo apt update && sudo apt install android-sdk-platform-tools</code>")
+                                    }
+
+                                    if (checkResult.adbCandidates.isNotEmpty()) {
+                                        append("<br><small style='color:#fcd34d;'>检测到可能的 adb 路径：${escapeHtml(checkResult.adbCandidates.joinToString(", "))}</small>")
                                     }
                                     append("</div>")
-                                } else if (checkResult.missingPackages.isNotEmpty()) {
-                                    append("<br><strong style='color:#ef4444;'>缺少的依赖包：</strong><br>")
-                                    checkResult.missingPackages.forEach {
-                                        append("• $it<br>")
-                                    }
-
-                                    // 如果有每个包的安装命令，优先显示
-                                    if (checkResult.missingPackagesWithCmd.isNotEmpty()) {
-                                        append("<br><strong>推荐安装方式（每个命令单独执行）：</strong><br>")
-                                        append("<div style='background:#2d2d2d; padding:12px; border-radius:4px; margin-top:10px; text-align:left;'>")
-
-                                        // 如果是 Mac 系统，添加特别说明
-                                        if (checkResult.osType == "Darwin") {
-                                            append("<div style='background:#422006; border-left:3px solid #f59e0b; padding:10px; margin-bottom:12px;'>")
-                                            append("<strong style='color:#fbbf24;'>⚠️ macOS 用户注意：</strong><br>")
-                                            append("<span style='color:#fcd34d; font-size:13px;'>")
-                                            append("Mac系统可能有多个Python环境（系统自带、Homebrew、pyenv等）。<br>")
-                                            append("请使用下面的 <code style='background:#1a1a1a; padding:2px 4px;'>python -m pip</code> 命令，")
-                                            append("这样可以确保安装到IDE使用的Python环境中。")
-                                            append("</span>")
-                                            append("</div>")
-                                        }
-
-                                        checkResult.missingPackagesWithCmd.forEach { (_, cmd) ->
-                                            append("<code style='display:block; color:#10b981; margin:5px 0; font-size:13px;'>")
-                                            append(cmd.replace("<", "&lt;").replace(">", "&gt;"))
-                                            append("</code>")
-                                        }
-                                        append("</div>")
-
-                                        // 显示可用的pip方法
-                                        if (checkResult.pipMethods.isNotEmpty()) {
-                                            append("<br><small style='color:#888;'>")
-                                            append("可用的pip命令: ${checkResult.pipMethods.joinToString(", ")}")
-                                            append("</small>")
-                                        }
-                                    } else {
-                                        // 降级到通用安装命令
-                                        append("<br><strong>安装命令：</strong><br>")
-                                        append("<code style='background:#2d2d2d; padding:8px; border-radius:4px; display:block; margin-top:10px;'>")
-                                        val pipCmd = checkResult.pipCmd ?: "pip3"
-                                        append("$pipCmd install ${checkResult.missingPackages.joinToString(" ")}")
-                                        append("</code>")
-                                    }
                                 }
+
+                                append("</div>")
                             },
                             canRetry = true
                         )
@@ -316,6 +286,14 @@ class CarUiToolWindowFactory : ToolWindowFactory {
                 }
             }
         })
+    }
+
+    private fun escapeHtml(raw: String): String {
+        return raw
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
     }
     
     private fun buildErrorHtml(title: String, message: String, details: String, canRetry: Boolean): String {

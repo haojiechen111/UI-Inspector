@@ -83,6 +83,13 @@ tasks {
         enabled = false // Speed up build
     }
 
+    // 兼容性修复：在部分 JDK 发行版（尤其非 JetBrains Runtime）上，instrumentCode
+    // 可能会因缺失 `Packages` 路径而失败（例如: /.../.jdks/.../Packages does not exist）。
+    // 本项目不依赖该步骤（无 GUI form instrument 需求），可安全关闭以提升构建成功率。
+    named("instrumentCode") {
+        enabled = false
+    }
+
     prepareSandbox {
         // 将插件目录下的 server 文件夹拷贝到安装包中
         from("server") {

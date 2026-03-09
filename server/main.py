@@ -118,14 +118,68 @@ def resolve_accessibility_target_serial(serial: str) -> str:
     - current_serial 用于截图/输入事件
     - 辅助服务 APK 仍运行在原始物理 serial 上
     """
-    global ss4_localhost_mapping
-    if serial == "localhost:5559" and serial in ss4_localhost_mapping:
-        candidate = ss4_localhost_mapping[serial].get("original_serial", serial)
-        # Fallback: some environments cannot run `settings/pm` on original_serial.
-        if candidate != serial and not _is_accessibility_shell_supported(candidate):
-            return serial
-        return candidate
+    if serial == "localhost:5559":
+        # 用户常见路径：直接连接 localhost:5559（本进程未走 init-ss4），
+        # 这里也尽量自动推断并优先使用可执行 settings/pm 的物理 serial。
+        cands = get_accessibility_candidate_serials(serial)
+        for s in cands:
+            if s != serial and _is_accessibility_shell_supported(s):
+                return s
+        return serial
     return serial
+
+
+def _list_adb_device_serials() -> List[str]:
+    """Best-effort parse `adb devices` and return online serials."""
+    try:
+        r = subprocess.run(
+            ["adb", "devices"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        out = (r.stdout or "")
+        serials: List[str] = []
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                serials.append(parts[0])
+        return serials
+    except Exception:
+        return []
+
+
+def infer_original_serial_from_localhost_forward() -> Optional[str]:
+    """Infer original serial for localhost:5559 from `adb forward --list`.
+
+    Typical SS4 mapping line:
+      <orig_serial> tcp:5559 tcp:5557
+    """
+    try:
+        r = subprocess.run(
+            ["adb", "forward", "--list"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        out = (r.stdout or "")
+        found: List[str] = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            dev, local_ep = parts[0], parts[1]
+            if local_ep == "tcp:5559":
+                found.append(dev)
+
+        for s in found:
+            if s and s != "localhost:5559":
+                return s
+    except Exception:
+        pass
+    return None
 
 
 def get_accessibility_candidate_serials(serial: str) -> List[str]:
@@ -138,22 +192,39 @@ def get_accessibility_candidate_serials(serial: str) -> List[str]:
     为了避免“选错 serial 导致一直显示未运行”，这里返回两者并由上层逐个探测。
     """
     global ss4_localhost_mapping
-    if serial == "localhost:5559" and serial in ss4_localhost_mapping:
-        orig = ss4_localhost_mapping[serial].get("original_serial")
-        cands: List[str] = []
+
+    if serial != "localhost:5559":
+        return [serial]
+
+    cands: List[str] = []
+
+    # 1) 首选：进程内已有映射
+    if serial in ss4_localhost_mapping:
+        orig = (ss4_localhost_mapping.get(serial) or {}).get("original_serial")
         if orig:
             cands.append(orig)
-        cands.append(serial)
 
-        # de-duplicate while preserving order
-        seen = set()
-        out: List[str] = []
-        for s in cands:
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-    return [serial]
+    # 2) 兜底：forward --list 推断
+    inferred = infer_original_serial_from_localhost_forward()
+    if inferred:
+        cands.append(inferred)
+
+    # 3) 兜底：仅一个非 localhost 在线时尝试它
+    non_local = [s for s in _list_adb_device_serials() if s != "localhost:5559"]
+    if len(non_local) == 1:
+        cands.append(non_local[0])
+
+    # 4) 最后保留 localhost 自身
+    cands.append(serial)
+
+    # de-duplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for s in cands:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def get_accessibility_target_serial_from_current() -> str:
