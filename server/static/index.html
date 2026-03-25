@@ -5,8 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>车载 UI 工具</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=9">
+    <link rel="stylesheet" href="style.css?v=11">
 </head>
 
 <body>
@@ -74,6 +73,7 @@
                 <h2>设备屏幕</h2>
                 <div class="panel-actions">
                     <button class="btn-icon-panel" onclick="toggleSidebar()" title="展开/收起右侧边栏">↔️</button>
+                    <button class="btn-icon-panel" onclick="toggleKeyPanel()" title="按键面板（返回/主页/音量等）">⌨️</button>
                     <div class="divider"></div>
                     <label class="toggle-switch" title="点击屏幕时同步点击真实设备">
                         <input type="checkbox" id="realControl">
@@ -86,7 +86,19 @@
                         <span class="slider"></span>
                         <span class="label-text">自动刷新</span>
                     </label>
-                    <button class="btn-secondary" onclick="refreshSnapshot()">📸 刷新</button>
+                    <label class="toggle-switch" title="高亮页面中 clickable=true 的控件范围">
+                        <input type="checkbox" id="highlightClickableBounds">
+                        <span class="slider"></span>
+                        <span class="label-text">可点击高亮</span>
+                    </label>
+                    <button id="refreshSnapshotBtn" class="btn-secondary" onclick="refreshSnapshot()">📸 刷新</button>
+                    <div class="divider"></div>
+                    <div class="zoom-controls">
+                        <button class="btn-icon-panel" onclick="zoomOut()" title="缩小">−</button>
+                        <span id="zoomLabel" class="zoom-label">100%</span>
+                        <button class="btn-icon-panel" onclick="zoomIn()" title="放大">+</button>
+                        <button class="btn-icon-panel" onclick="resetZoom()" title="重置缩放">⊙</button>
+                    </div>
                 </div>
             </div>
             <div id="screen-container">
@@ -121,6 +133,17 @@
             <div class="panel tree-panel" id="treePanel">
                 <div class="panel-header">
                     <h2>UI 层级结构</h2>
+                    <div class="tree-toolbar">
+                        <input type="text" id="treeFilter" class="tree-filter-input"
+                            placeholder="🔍 过滤节点（支持 resource-id / content-desc）..."
+                            oninput="filterTreeNodes(this.value)"
+                            onkeydown="if(event.key==='Enter')findAndJumpToNode(this.value)"
+                            title="实时过滤 UI 树节点（节点名/resource-id/content-desc）&#10;按 Enter 跳转，多个匹配时弹出选择">
+                        <button class="btn-icon-panel" id="treeFilterClearBtn" onclick="clearTreeFilter()"
+                            title="清除过滤" style="display:none">✕</button>
+                        <button class="btn-icon-panel" onclick="expandAllTree()" title="全部展开">⊞</button>
+                        <button class="btn-icon-panel" onclick="collapseAllTree()" title="全部折叠">⊟</button>
+                    </div>
                 </div>
                 <div id="tree-container" class="tree-view">
                     <div class="empty-state">暂无层级数据</div>
@@ -262,8 +285,67 @@
         </div>
     </div>
 
+    <!-- APK Install Helper Modal -->
+    <div id="apkInstallModal" class="modal" onclick="closeApkInstallModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()" style="max-width:500px">
+            <div class="modal-header">
+                <h3>📦 辅助服务 APK 安装</h3>
+                <button class="modal-close" onclick="closeApkInstallModal()">×</button>
+            </div>
+            <div class="modal-body">
+                <p style="color:#f87171;margin-bottom:16px;">
+                    辅助服务已启用，但服务尚未运行。<br>
+                    请选择安装方式将 APK 安装到当前设备：
+                </p>
+                <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+                    <button class="btn-primary" id="btnInstallNormal" onclick="doInstallApk(false)">
+                        ▶ Install
+                    </button>
+                    <button class="btn-primary" id="btnInstallNoStream" onclick="doInstallApk(true)"
+                        title="使用 --no-streaming 模式，适用于某些车机设备（如 SS4 localhost:5559）">
+                        ▶ Install --no-streaming
+                    </button>
+                </div>
+                <div id="apkInstallProgress" style="display:none;margin-bottom:10px;">
+                    <span style="color:#60a5fa;font-size:13px;">⏳ 正在安装，请稍候（最长90秒）...</span>
+                </div>
+                <div id="apkInstallResult" style="font-size:13px;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;background:#1e293b;padding:10px;border-radius:6px;display:none;"></div>
+                <button id="btnApkReconnect" class="btn-primary"
+                    style="display:none;width:100%;margin-top:12px;"
+                    onclick="closeApkInstallModal();connectDevice()">
+                    🔗 安装完成，重新检测辅助服务
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notice container (轻量级非阻塞通知，替代 alert) -->
+    <div id="noticeContainer" class="notice-container"></div>
+
+    <!-- #L5 按键浮层面板 -->
+    <div id="keyPanel" class="key-panel hidden">
+        <div class="key-panel-title">按键</div>
+        <button class="key-btn" onclick="sendKey('Back')">◀ 返回</button>
+        <button class="key-btn" onclick="sendKey('Home')">⌂ 主页</button>
+        <button class="key-btn" onclick="sendKey('Recents')">▣ 最近</button>
+        <button class="key-btn" onclick="sendKey('VolumeUp')">🔊 音量+</button>
+        <button class="key-btn" onclick="sendKey('VolumeDown')">🔉 音量-</button>
+        <button class="key-btn" onclick="sendKey('Power')">⏻ 电源</button>
+    </div>
+
+    <!-- Node Picker Dialog -->
+    <div id="nodePickerDialog" class="node-picker-dialog" onclick="if(event.target===this)closeNodePickerDialog()">
+        <div class="node-picker-content">
+            <div class="node-picker-header">
+                <span id="nodePickerCount"></span>
+                <button class="node-picker-close" onclick="closeNodePickerDialog()">×</button>
+            </div>
+            <div id="nodePickerList" class="node-picker-list"></div>
+        </div>
+    </div>
+
     <!-- bump version to avoid JCEF cache -->
-    <script src="app.js?v=13"></script>
+    <script src="app.js?v=22"></script>
 </body>
 
 </html>

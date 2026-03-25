@@ -31,10 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Robust Path Resolution using sys.path[0]
-import os
-import sys
-
 # Logging setup
 print(f"Startup: sys.path[0]={sys.path[0]}")
 print(f"Startup: __file__={__file__}")
@@ -327,66 +323,100 @@ def api_diagnose_secure():
         raise HTTPException(status_code=400, detail="Device not connected")
     return diagnose_secure_layers(current_serial)
 
+def _parse_displays_from_dumpsys(dump_out: str) -> List[Dict]:
+    """从 dumpsys display 输出中解析逻辑 display 列表（含分辨率）。
+
+    主要策略：
+    1. 按 "Display Device" 块拆分，从每块提取 mDisplayId + 分辨率
+    2. 若块解析失败，fallback 到全文 mDisplayId= 扫描
+    """
+    result: List[Dict] = []
+    seen: set = set()
+
+    # 按 "Display Device" 块切分（Android 10+ 格式）
+    blocks = re.split(r"Display Device\s+", dump_out)
+    for block in blocks[1:]:
+        id_m = re.search(r"mDisplayId=(\d+)", block)
+        if not id_m:
+            continue
+        did = id_m.group(1)
+        if did in seen:
+            continue
+        seen.add(did)
+        # 分辨率：形如 "1920 x 720," 或 "1920 x 720 "
+        res_m = re.search(r"(\d{3,5})\s+x\s+(\d{3,5})", block)
+        res_str = f" {res_m.group(1)}x{res_m.group(2)}" if res_m else ""
+        result.append({"id": did, "description": f"Display {did}{res_str}"})
+
+    # Fallback: 全文扫描 mDisplayId=N（无分辨率信息）
+    if not result:
+        for m in re.finditer(r"mDisplayId=(\d+)", dump_out):
+            did = m.group(1)
+            if did not in seen:
+                seen.add(did)
+                result.append({"id": did, "description": f"Display {did}"})
+
+    return sorted(result, key=lambda x: int(x["id"]))
+
+
 def refresh_display_mapping(serial: str):
+    """更新 display_mapping / display_info_cache 全局变量（供截图坐标映射用）。
+
+    返回解析到的 display 列表；解析失败返回 None。
+    """
     global display_mapping, display_info_cache
     try:
-        # 1. Get Physical IDs from SurfaceFlinger
-        sf_output = subprocess.run(["adb", "-s", serial, "shell", "dumpsys SurfaceFlinger --display-id"], 
-                                   capture_output=True, text=True, timeout=5).stdout
-        
-        # 2. Get Logical ID mapping from dumpsys display
-        display_output = subprocess.run(["adb", "-s", serial, "shell", "dumpsys display"], 
-                                       capture_output=True, text=True, timeout=5).stdout
-        
-        new_mapping = {}
-        info_list = []
-        
-        # Parse SurfaceFlinger for physical IDs and names
-        sf_matches = re.finditer(r"Display ([\d]{10,20}) .*?displayName=\"([^\"]+)\"", sf_output)
-        phys_to_name = {m.group(1): m.group(2) for m in sf_matches}
-        
-        # Parse dumpsys display for Logical to Physical mapping
-        devices_blocks = display_output.split("Display Device ")
-        for block in devices_blocks[1:]:
-            id_match = re.search(r"mDisplayId=([\d]+)", block)
-            unique_match = re.search(r"mUniqueId=local:([\d]{10,20})", block)
-            if id_match and unique_match:
-                logical = id_match.group(1)
-                physical = unique_match.group(1)
-                new_mapping[logical] = physical
-                
-                name = phys_to_name.get(physical, f"Display {logical}")
-                # Try to find resolution
-                res_match = re.search(r"([\d]+) x ([\d]+),", block)
-                res_str = ""
-                if res_match:
-                    res_str = f" ({res_match.group(1)}x{res_match.group(2)})"
-                
-                desc = name
-                if logical == "0": desc = f"Main Driver ({name})"
-                elif logical == "2": desc = f"Passenger ({name})"
-                elif logical == "4": desc = f"Rear Left ({name})"
-                elif logical == "5": desc = f"Rear Right ({name})"
-                
-                info_list.append({
-                    "id": logical, 
-                    "physical_id": physical,
-                    "description": f"{desc}{res_str}"
-                })
+        # 优先使用简单 dumpsys display 解析
+        dump_r = subprocess.run(
+            ["adb", "-s", serial, "shell", "dumpsys", "display"],
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+        dump_out = dump_r.stdout or ""
+        info_list = _parse_displays_from_dumpsys(dump_out)
 
         if not info_list:
-            # 如果无法获取display信息，返回None让调用方使用静态fallback
             return None
 
-        display_mapping = new_mapping
+        # 补充物理ID映射（最佳努力，不阻塞返回）
+        try:
+            sf_output = subprocess.run(
+                ["adb", "-s", serial, "shell", "dumpsys SurfaceFlinger --display-id"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout or ""
+            phys_to_name = dict(re.findall(
+                r"Display (\d{10,20}).*?displayName=\"([^\"]+)\"", sf_output
+            ))
+            new_mapping: Dict[str, str] = {}
+            for m in re.finditer(r"mDisplayId=(\d+).*?mUniqueId=local:(\d{10,20})", dump_out, re.DOTALL):
+                logical, physical = m.group(1), m.group(2)
+                new_mapping[logical] = physical
+                # 用物理屏名称覆盖描述（可选，不覆盖分辨率）
+                if physical in phys_to_name:
+                    name = phys_to_name[physical]
+                    for item in info_list:
+                        if item["id"] == logical and name:
+                            # 保留分辨率后缀
+                            res_suffix = re.search(r"(\s+\d+x\d+)$", item["description"])
+                            item["description"] = f"{name}{res_suffix.group(1) if res_suffix else ''}"
+            if new_mapping:
+                display_mapping = new_mapping
+        except Exception:
+            pass
+
         display_info_cache = info_list
         return info_list
     except Exception as e:
-        print(f"Error refreshing display mapping: {e}")
+        print(f"[refresh_display_mapping] Error: {e}")
         return None
 
+# ── SS 设备类型缓存（避免每帧截图都重复 getprop，节省 ADB 往返） ──────────────
+_ss_type_cache: Dict[str, Optional[str]] = {}
+
 def detect_ss_device(serial: str) -> Optional[str]:
-    """Detect if device is SS series (SS4, SS3, etc.) by checking display.id property"""
+    """Detect if device is SS series (SS4, SS3, etc.) by checking display.id property.
+    Result is cached per serial to avoid redundant ADB calls on every screenshot frame."""
+    if serial in _ss_type_cache:
+        return _ss_type_cache[serial]
     try:
         # Use getprop directly to get ro.build.display.id
         result = subprocess.run(
@@ -408,27 +438,28 @@ def detect_ss_device(serial: str) -> Optional[str]:
         print(f"[SS_DETECT] 🔠 Uppercase: '{output_upper}'")
         
         # Direct string search - most reliable method
+        ss_result: Optional[str] = None
         if 'SS4' in output_upper:
             print(f"[SS_DETECT] ✅✅✅ Detected SS4 device (string match): {serial}")
-            return "SS4"
+            ss_result = "SS4"
         elif 'SS3' in output_upper:
             print(f"[SS_DETECT] ✅✅✅ Detected SS3 device (string match): {serial}")
-            return "SS3"
+            ss_result = "SS3"
         elif 'SS2' in output_upper:
             print(f"[SS_DETECT] ✅✅✅ Detected SS2 device (string match): {serial}")
-            return "SS2"
+            ss_result = "SS2"
         elif 'SS5' in output_upper:
             print(f"[SS_DETECT] ✅✅✅ Detected SS5 device (string match): {serial}")
-            return "SS5"
+            ss_result = "SS5"
         else:
             print(f"[SS_DETECT] ❌ No SS device pattern found")
-            print(f"[SS_DETECT] 💡 If this should be an SS device, check the display.id format")
-        
-        return None
+        _ss_type_cache[serial] = ss_result
+        return ss_result
     except Exception as e:
         print(f"[SS_DETECT] ⚠️ Exception occurred: {e}")
         import traceback
         traceback.print_exc()
+        _ss_type_cache[serial] = None  # cache negative to avoid retry storms
         return None
 
 @app.get("/api/devices")
@@ -587,53 +618,54 @@ def get_displays(serial: Optional[str] = None):
     print(f"[DISPLAYS] Device serial: {target_serial}")
     print(f"[DISPLAYS] 开始动态探测设备的display配置...")
     
-    # 尝试动态获取设备实际支持的display列表
+    # === Method 1: dumpsys display 解析（最可靠，含分辨率）===
     res = refresh_display_mapping(target_serial)
     if res:
-        # 只显示Display ID，不添加额外描述
-        print(f"[DISPLAYS] 从dumpsys获取到 {len(res)} 个display")
-        for display in res:
-            display_id = display["id"]
-            display["description"] = f"Display {display_id}"
+        print(f"[DISPLAYS] ✅ dumpsys 解析到 {len(res)} 个 display: {[d['id'] for d in res]}")
         return res
-    
-    # 如果无法获取，尝试通过screencap探测实际可用的display
-    print(f"[DISPLAYS] dumpsys方式失败，尝试探测可用display...")
+
+    # === Method 2: wm size -d N 逐个探测（快速，有分辨率）===
+    print(f"[DISPLAYS] dumpsys 方式失败，尝试 wm size 探测...")
     available_displays = []
-    
-    try:
-        d = adb.device(serial=target_serial)
-        # 探测display 0-5，看哪些可用
-        for display_id in range(6):
-            try:
-                # 尝试快速截图测试display是否存在
-                result = subprocess.run(
-                    ["adb", "-s", target_serial, "shell", f"screencap -d {display_id} -p"],
-                    capture_output=True, 
-                    timeout=2,
-                    check=False
-                )
-                # 如果返回数据大于100字节且包含PNG头，说明display存在
-                if result.returncode == 0 and len(result.stdout) > 100 and b"\x89PNG" in result.stdout:
-                    available_displays.append({
-                        "id": str(display_id),
-                        "description": f"Display {display_id}"
-                    })
-                    print(f"[DISPLAYS] ✅ Display {display_id} 可用")
-                else:
-                    print(f"[DISPLAYS] ❌ Display {display_id} 不可用或无响应")
-            except Exception as e:
-                print(f"[DISPLAYS] ⚠️ Display {display_id} 探测失败: {e}")
-                continue
-    except Exception as e:
-        print(f"[DISPLAYS] ⚠️ 探测过程出错: {e}")
-    
-    # 如果探测到了display，返回探测结果
+    for display_id in range(6):
+        try:
+            r = subprocess.run(
+                ["adb", "-s", target_serial, "shell", f"wm size -d {display_id}"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            out = (r.stdout or "").strip()
+            if r.returncode == 0 and re.search(r"\d+x\d+", out):
+                m = re.search(r"(\d+)x(\d+)", out)
+                res_str = f" {m.group(1)}x{m.group(2)}" if m else ""
+                available_displays.append({"id": str(display_id), "description": f"Display {display_id}{res_str}"})
+                print(f"[DISPLAYS] ✅ wm size: Display {display_id} = {out.strip()}")
+        except Exception as e:
+            print(f"[DISPLAYS] ⚠️ wm size Display {display_id}: {e}")
+            continue
+
     if available_displays:
-        print(f"[DISPLAYS] 探测成功，找到 {len(available_displays)} 个可用display")
+        print(f"[DISPLAYS] wm size 探测到 {len(available_displays)} 个 display")
         return available_displays
-    
-    # 最后的fallback：至少返回display 0
+
+    # === Method 3: screencap 兜底（最慢，timeout 5s/屏）===
+    print(f"[DISPLAYS] wm size 也失败，fallback 到 screencap 探测...")
+    for display_id in range(6):
+        try:
+            result = subprocess.run(
+                ["adb", "-s", target_serial, "shell", f"screencap -d {display_id} -p"],
+                capture_output=True, timeout=5, check=False,
+            )
+            if result.returncode == 0 and len(result.stdout) > 100 and b"\x89PNG" in result.stdout:
+                available_displays.append({"id": str(display_id), "description": f"Display {display_id}"})
+                print(f"[DISPLAYS] ✅ screencap: Display {display_id} 可用")
+        except Exception as e:
+            print(f"[DISPLAYS] ⚠️ screencap Display {display_id}: {e}")
+            continue
+
+    if available_displays:
+        print(f"[DISPLAYS] screencap 探测到 {len(available_displays)} 个 display")
+        return available_displays
+
     print(f"[DISPLAYS] 所有方式都失败，返回最小配置 (Display 0)")
     return [{"id": "0", "description": "Display 0"}]
 
@@ -679,8 +711,8 @@ def get_screenshot(display: str = "0"):
         print(f"[SCREENSHOT] 📸 请求截图 - Display ID: {display}, Device: {current_serial}")
         
         # Detect device type for special handling
-        ss_type = detect_ss_device(current_serial)
-        print(f"[SCREENSHOT] 🚗 设备类型: {ss_type}")
+        ss_type = detect_ss_device(current_serial)  # cached after first call
+        print(f"[SCREENSHOT] 🚗 设备类型: {ss_type} (cached={current_serial in _ss_type_cache})")
         
         # Use physical ID for screencap if available
         phys_id = display_mapping.get(display, display)
@@ -1005,7 +1037,7 @@ def ensure_accessibility_service(
                 install_ok = False
                 last_install_err = ""
                 for s in install_try_serials:
-                    ir = _adb_run(["adb", "-s", s, "install", "-r", apk_path], timeout=90)
+                    ir = _adb_run(["adb", "-s", s, "install", "--no-streaming", "-r", "-t", "-d", apk_path], timeout=90)
                     if ir.returncode == 0:
                         install_ok = True
                         install_serial = s
@@ -1257,10 +1289,8 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
             print(f"[Hierarchy] ⚠️ 辅助服务不可用，fallback到UIAutomator")
     
     # 步骤1：优先使用UIAutomator
-    # 步骤1：使用UIAutomator获取hierarchy
     print(f"[Hierarchy] 🔍 使用UIAutomator获取...")
     uiautomator_xml = None
-    original_xml_for_check = None  # 用于完整性检查的原始XML（转换前）
     try:
         import xml.etree.ElementTree as ET
         d = adb.device(serial=current_serial)
@@ -1317,8 +1347,6 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
         
         print(f"[Hierarchy] 成功获取UI层级,XML长度: {len(xml_content)}")
         
-        # 保存原始XML用于完整性检查（在坐标转换之前）
-        original_xml_for_check = xml_content
         uiautomator_xml = xml_content
         
         # 处理多窗口多display XML格式：合并所有相关display的窗口
@@ -1602,36 +1630,6 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
                 
                 print(f"[Hierarchy] ✅ 合并完成：{window_count} 个窗口，{node_count} 个顶层节点")
                 
-                # 调试：在合并后的hierarchy中查找"关闭"节点
-                def find_nodes_with_text(element, text_pattern):
-                    results = []
-                    if element.tag == 'node':
-                        node_text = element.get('text', '')
-                        content_desc = element.get('content-desc', '')
-                        if text_pattern in node_text or text_pattern in content_desc:
-                            results.append({
-                                'text': node_text,
-                                'content-desc': content_desc,
-                                'bounds': element.get('bounds'),
-                                'class': element.get('class'),
-                                'resource-id': element.get('resource-id'),
-                                'clickable': element.get('clickable')
-                            })
-                    for child in element:
-                        results.extend(find_nodes_with_text(child, text_pattern))
-                    return results
-                
-                close_nodes = find_nodes_with_text(merged_hierarchy, '关闭')
-                if close_nodes:
-                    print(f"[Hierarchy] 📍 合并后找到 {len(close_nodes)} 个'关闭'节点:")
-                    for idx, node in enumerate(close_nodes):
-                        print(f"[Hierarchy]    [{idx}] {node['class']}")
-                        print(f"[Hierarchy]        Bounds: {node['bounds']}")
-                        print(f"[Hierarchy]        Text: '{node['text']}'")
-                        print(f"[Hierarchy]        Content-desc: '{node['content-desc']}'")
-                        print(f"[Hierarchy]        Resource-ID: {node['resource-id']}")
-                        print(f"[Hierarchy]        Clickable: {node['clickable']}")
-                
                 xml_content = ET.tostring(merged_hierarchy, encoding='unicode')
                 xml_content = '<?xml version="1.0" encoding="UTF-8"?>' + xml_content
                 print(f"[Hierarchy] 合并后XML长度: {len(xml_content)}")
@@ -1761,6 +1759,46 @@ def back_button(req: BackRequest):
 
 
 
+# ── 通用按键事件 ───────────────────────────────────────────────────────────────
+_KEY_MAP: Dict[str, int] = {
+    "BACK":         4,
+    "HOME":         3,
+    "RECENTS":      187,
+    "APP_SWITCH":   187,
+    "VOLUME_UP":    24,
+    "VOLUME_DOWN":  25,
+    "POWER":        26,
+    "MENU":         82,
+    "ENTER":        66,
+    "DPAD_UP":      19,
+    "DPAD_DOWN":    20,
+    "DPAD_LEFT":    21,
+    "DPAD_RIGHT":   22,
+    "DPAD_CENTER":  23,
+}
+
+class KeyEventRequest(BaseModel):
+    key: str
+    display: int = 0
+
+@app.post("/api/keyevent")
+def send_keyevent(req: KeyEventRequest):
+    global current_serial
+    if not current_serial:
+        raise HTTPException(status_code=400, detail="Device not connected")
+    code = _KEY_MAP.get(req.key.upper())
+    if code is None:
+        raise HTTPException(status_code=400, detail=f"Unknown key: {req.key}. Valid keys: {list(_KEY_MAP.keys())}")
+    try:
+        d = adb.device(serial=current_serial)
+        if req.display > 0:
+            d.shell(f"input -d {req.display} keyevent {code}")
+        else:
+            d.shell(f"input keyevent {code}")
+        return {"ok": True, "key": req.key, "code": code, "display": req.display}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/accessibility/enable")
 def enable_accessibility_service():
     """启用辅助服务"""
@@ -1861,6 +1899,57 @@ def api_ensure_accessibility(req: EnsureAccessibilityRequest):
         enable_service=req.enable_service,
         probe_running=req.probe_running,
     )
+
+class InstallApkRequest(BaseModel):
+    serial: Optional[str] = None
+    no_streaming: bool = False
+
+
+@app.post("/api/accessibility/install-apk")
+def api_install_apk(req: InstallApkRequest):
+    """手动安装辅助服务 APK，支持 --no-streaming 模式（适用于某些车机设备）。"""
+    global current_serial
+    serial = req.serial or current_serial
+    if not serial:
+        raise HTTPException(status_code=400, detail="未选择设备")
+
+    # 查找 APK 路径（优先 bundled，其次 dev build）
+    bundled = os.path.join(script_dir, "CarUIAccessibilityService-debug.apk")
+    dev_path = os.path.abspath(
+        os.path.join(
+            script_dir,
+            "..",
+            "accessibility_service",
+            "build",
+            "outputs",
+            "apk",
+            "debug",
+            "CarUIAccessibilityService-debug.apk",
+        )
+    )
+    if os.path.exists(bundled):
+        apk_path = bundled
+    elif os.path.exists(dev_path):
+        apk_path = dev_path
+    else:
+        raise HTTPException(status_code=404, detail="APK 文件不存在，请先编译辅助服务模块")
+
+    if req.no_streaming:
+        cmd = ["adb", "-s", serial, "install", "--no-streaming", "-r", "-t", "-d", apk_path]
+    else:
+        cmd = ["adb", "-s", serial, "install", "-r", "-t", apk_path]
+
+    result = _adb_run(cmd, timeout=90)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    success = result.returncode == 0
+    return {
+        "success": success,
+        "output": output,
+        "serial": serial,
+        "apk_path": apk_path,
+        "no_streaming": req.no_streaming,
+    }
+
 
 @app.post("/api/accessibility/disable")
 def disable_accessibility_service():

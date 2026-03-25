@@ -69,6 +69,32 @@ def _detect_pip(python_executable: str, python_cmd: str) -> Tuple[Optional[str],
     return pip_cmd, dedup, pip_cmd is not None
 
 
+def _is_externally_managed() -> bool:
+    """检测当前 Python 是否受 PEP 668 externally-managed 保护（Homebrew/系统 Python 常见）。"""
+    try:
+        import sysconfig
+        platlib = sysconfig.get_path("platlib") or ""
+        # EXTERNALLY-MANAGED 文件在 platlib 的上一级目录
+        marker = os.path.join(os.path.dirname(platlib), "EXTERNALLY-MANAGED")
+        if os.path.exists(marker):
+            return True
+    except Exception:
+        pass
+    # 兜底：实际运行 pip install --dry-run 检测错误信息
+    try:
+        import tempfile
+        rc, out, err = _run(
+            [sys.executable, "-m", "pip", "install", "--dry-run", "--quiet", "pip"],
+            timeout=6,
+        )
+        combined = (out + err).lower()
+        if "externally-managed" in combined or "externally managed" in combined:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _detect_adb() -> Dict:
     """Detect adb command and version, with fallback path hints."""
     info = {
@@ -155,6 +181,9 @@ def check_dependencies() -> int:
     python_version_full = sys.version.split()[0]
     python_executable = sys.executable
     python_cmd = os.path.basename(python_executable) or "python"
+    externally_managed = _is_externally_managed()
+    # 当环境受保护时，需要追加 --break-system-packages 标志
+    pip_extra_flag = " --break-system-packages" if externally_managed else ""
 
     python_version_from_cmd = None
     rc, out, err = _run([python_executable, "--version"], timeout=4)
@@ -209,9 +238,9 @@ def check_dependencies() -> int:
         except ImportError as e:
             missing_packages.append(pip_name)
             install_cmd = (
-                f"{python_cmd} -m pip install {pip_name}"
+                f"{python_cmd} -m pip install{pip_extra_flag} {pip_name}"
                 if pip_ok
-                else f"{pip_bootstrap_cmd} && {python_cmd} -m pip install {pip_name}"
+                else f"{pip_bootstrap_cmd} && {python_cmd} -m pip install{pip_extra_flag} {pip_name}"
             )
             results["dependencies"][pip_name] = {
                 "installed": False,
@@ -224,10 +253,11 @@ def check_dependencies() -> int:
         # 对最终用户更易理解的一键命令
         joined = " ".join(sorted(set(missing_packages)))
         results["install_all_cmd"] = (
-            f"{python_cmd} -m pip install {joined}"
+            f"{python_cmd} -m pip install{pip_extra_flag} {joined}"
             if pip_ok
-            else f"{pip_bootstrap_cmd} && {python_cmd} -m pip install {joined}"
+            else f"{pip_bootstrap_cmd} && {python_cmd} -m pip install{pip_extra_flag} {joined}"
         )
+        results["externally_managed"] = externally_managed
 
     recommendations: List[str] = []
     if not results["python_ok"]:

@@ -5,14 +5,22 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.openapi.wm.ex.ToolWindowManagerListener
 import com.intellij.ui.content.ContentFactory
+import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.application.ApplicationManager
 import java.awt.BorderLayout
+import java.awt.Color
 import java.awt.FlowLayout
+import java.awt.Font
+import javax.swing.BorderFactory
 import javax.swing.JButton
+import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JScrollPane
+import javax.swing.JTextArea
+import javax.swing.SwingConstants
 
 class CarUiToolWindowFactory : ToolWindowFactory {
 
@@ -230,9 +238,70 @@ class CarUiToolWindowFactory : ToolWindowFactory {
             }.start()
         }
 
+        fun showSwingErrorPanel(title: String, body: String) {
+            panel.removeAll()
+            panel.add(toolbar, BorderLayout.NORTH)
+            val bg = Color(26, 26, 26)
+            val errPanel = JPanel(BorderLayout()).apply { background = bg; border = BorderFactory.createEmptyBorder(30, 30, 30, 30) }
+            val titleLabel = JLabel("⚠️  $title", SwingConstants.CENTER).apply {
+                foreground = Color(239, 68, 68); font = Font("SansSerif", Font.BOLD, 16); border = BorderFactory.createEmptyBorder(0, 0, 12, 0)
+            }
+            val textArea = JTextArea(body).apply {
+                isEditable = false; lineWrap = true; wrapStyleWord = true
+                background = Color(38, 38, 38); foreground = Color(200, 200, 200)
+                font = Font("Monospaced", Font.PLAIN, 13); border = BorderFactory.createEmptyBorder(12, 12, 12, 12)
+            }
+            errPanel.add(titleLabel, BorderLayout.NORTH)
+            errPanel.add(JScrollPane(textArea).apply { background = bg; border = BorderFactory.createLineBorder(Color(63, 63, 70)) }, BorderLayout.CENTER)
+            panel.add(errPanel, BorderLayout.CENTER)
+            panel.revalidate()
+            panel.repaint()
+        }
+
         fun ensureBrowserRunning() {
             if (browser != null) return
-            val newBrowser = JBCefBrowser()
+
+            // ① 检查 JCEF 是否可用
+            // 注意：Registry 里的 ide.browser.jcef.enabled 只是软开关，
+            // 如果当前 JBR（JetBrains Runtime）本身不含 JCEF 运行时，isSupported() 仍然返回 false。
+            // 真正的解决办法是切换到带 JCEF 的 JBR。
+            if (!JBCefApp.isSupported()) {
+                showSwingErrorPanel(
+                    "JCEF 内嵌浏览器不可用",
+                    "该插件需要 JCEF（内嵌 Chromium）来渲染 UI。\n" +
+                    "当前 Android Studio 使用的 JBR 运行时不包含 JCEF，\n" +
+                    "仅开启 Registry 开关无效，需要切换到含 JCEF 的 JBR。\n\n" +
+                    "【推荐修复方法】切换 JBR（含 JCEF 版本）：\n" +
+                    "1. 打开 Help > Find Action（⌘+Shift+A）\n" +
+                    "2. 搜索并打开 \"Choose Boot Java Runtime for the IDE\"\n" +
+                    "3. 在列表中选择名称含 \"jcef\" 的版本（如 JetBrains Runtime 17 with JCEF）\n" +
+                    "4. 点击 OK，IDE 会自动下载并重启\n\n" +
+                    "【备用方法】如果没有 jcef 选项，升级 Android Studio 到最新版：\n" +
+                    "https://developer.android.com/studio\n\n" +
+                    "【验证】重启后再次打开此插件，若不再显示本提示则修复成功。"
+                )
+                return
+            }
+
+            // ② 创建浏览器（加 try-catch，防止 Mac 上 JCEF 初始化异常导致 panel 完全空白）
+            val newBrowser = try {
+                JBCefBrowser()
+            } catch (e: Exception) {
+                showSwingErrorPanel(
+                    "内嵌浏览器初始化失败",
+                    "JBCefBrowser 初始化时发生异常，插件 UI 无法显示。\n\n" +
+                    "错误信息：${e.message ?: e.javaClass.simpleName}\n\n" +
+                    "可能原因：\n" +
+                    "• Mac 上 GPU 驱动/显示配置异常\n" +
+                    "• IDE 版本与插件不兼容\n\n" +
+                    "建议：\n" +
+                    "1. 尝试重启 Android Studio\n" +
+                    "2. 关闭 IDE 后删除 ~/Library/Caches/Google/AndroidStudio*/tmp/jcef_cache\n" +
+                    "3. 在 Help > Diagnostic Tools > GPU Diagnostics 查看 GPU 状态"
+                )
+                return
+            }
+
             newBrowser.loadHTML(loadingHtml)
             browser = newBrowser
             attachBrowser(newBrowser)

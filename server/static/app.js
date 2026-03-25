@@ -1121,6 +1121,8 @@ async function connectDevice() {
                     addLogEntry('✅ 无障碍APK已就绪（已安装或已自动安装）', 'success');
                 } else {
                     addLogEntry('⚠️ 无障碍APK未安装（可能是 adb/权限/serial 问题）', 'warning');
+                    // APK 未安装 → 弹出手动安装引导弹窗
+                    showApkInstallModal();
                 }
             } else {
                 const errText = await ensureApkRes.text();
@@ -1237,7 +1239,9 @@ async function updateAccessibilityUIStatus() {
 
     if (!data.enabled || !data.running) {
         addLogEntry(`⚠️ 辅助服务异常：${enabledText} / ${runningText}`, 'warning');
-        addLogEntry('💡 建议：到系统“无障碍”里打开 CarUI Accessibility；或重启服务后重连', 'info');
+        addLogEntry('💡 建议：到系统"无障碍"里打开 CarUI Accessibility；或重启服务后重连', 'info');
+        // 辅助服务未运行 → 弹出 APK 安装/引导弹窗
+        showApkInstallModal();
     } else {
         addLogEntry('✅ 辅助服务运行正常', 'success');
     }
@@ -1249,7 +1253,7 @@ async function refreshSnapshot(forceShowLoading = true) {
     if (screenEmpty) screenEmpty.classList.add('hidden');
 
     // 给刷新按钮添加视觉反馈和马里奥金币动画
-    const refreshBtn = document.querySelector('.btn-secondary');
+    const refreshBtn = document.getElementById('refreshSnapshotBtn');
     if (refreshBtn) {
         refreshBtn.classList.add('refreshing');
         refreshBtn.textContent = '? 刷新中...';
@@ -1357,6 +1361,12 @@ function drawScreen() {
     // 绘制点击位置的红色十字准星
     if (lastClickX !== null && lastClickY !== null) {
         drawClickCrosshair(lastClickX, lastClickY);
+    }
+
+    // 绘制 clickable=true 节点高亮边框
+    const hlClickable = document.getElementById('highlightClickableBounds');
+    if (hlClickable && hlClickable.checked && rootNode) {
+        _highlightAllClickable(rootNode);
     }
 
     ctx.restore();
@@ -1709,6 +1719,11 @@ function traverseAndBuildTree(xmlNode, parentElement) {
 
     mapNodeToDom.set(xmlNode, { container, content, toggle });
 
+    // 存储搜索辅助属性，供 filterTreeNodes / findAndJumpToNode 使用
+    content.dataset.resourceId = attrs['resource-id'] || '';
+    content.dataset.contentDesc = attrs['content-desc'] || '';
+    content._xmlNode = xmlNode; // DOM → xmlNode 反向查找
+
     container.appendChild(content);
 
     if (children.length > 0) {
@@ -1876,17 +1891,6 @@ function textMatches(text, pattern, ignoreCase) {
     return searchText.includes(searchPattern);
 }
 
-function highlightText(text, pattern, ignoreCase) {
-    if (!text || !pattern) return text;
-    
-    const flags = ignoreCase ? 'gi' : 'g';
-    const regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
-    
-    return text.replace(regex, (match) => {
-        return `<span style="color: ${searchSettings.foreColor}; font-weight: bold; text-decoration: underline;">${match}</span>`;
-    });
-}
-
 // 使用指定颜色高亮文本
 function highlightTextWithColor(text, pattern, foreColor, ignoreCase) {
     if (!text || !pattern) return text;
@@ -1941,12 +1945,7 @@ function getCanvasCoords(e) {
     const deviceX = clickX * scaleX;
     const deviceY = clickY * scaleY;
 
-    return {
-        x: deviceX,
-        y: deviceY,
-        rawX: deviceX,
-        rawY: deviceY
-    };
+    return { x: deviceX, y: deviceY };
 }
 
 canvas.onmousedown = (e) => {
@@ -1954,8 +1953,8 @@ canvas.onmousedown = (e) => {
     if (e.button !== 0) return;
     isDragging = true;
     const coords = getCanvasCoords(e);
-    startX = coords.rawX;
-    startY = coords.rawY;
+    startX = coords.x;
+    startY = coords.y;
     dragStartTime = new Date().getTime();
 };
 
@@ -1998,8 +1997,8 @@ canvas.onmouseup = (e) => {
     
     isDragging = false;
 
-    const endX = coords.rawX;
-    const endY = coords.rawY;
+    const endX = coords.x;
+    const endY = coords.y;
     const dist = Math.sqrt(Math.pow(endX - startX, 2) + Math.pow(endY - startY, 2));
 
     const realControl = document.getElementById('realControl');
@@ -2124,11 +2123,9 @@ async function performRealClick(x, y) {
                 display: parseInt(currentDisplay || 0)
             })
         });
-        // Optional: Trigger refresh after a delay?
-        if (document.getElementById('autoRefresh').checked) {
-            // Screen will auto refresh soon
-        } else {
-            setTimeout(refreshScreen, 100); // Trigger a refresh after click
+        // 若没有开启自动刷新，手动触发一次截图更新
+        if (!document.getElementById('autoRefresh').checked) {
+            setTimeout(refreshScreen, 100);
         }
     } catch (e) {
         console.error("Click Failed", e);
@@ -2878,4 +2875,292 @@ if (splitter && propsPanel && sidebar) {
             splitter.classList.remove('active');
         }
     });
+}
+
+// ── highlightClickableBounds 辅助 ──────────────────────────────────────────────
+function _highlightAllClickable(node) {
+    if (!node) return;
+    const attrs = getAttributes(node);
+    if (attrs['clickable'] === 'true') {
+        drawHighlight(node, '#22d3ee', 'rgba(34, 211, 238, 0.12)', 1);
+    }
+    Array.from(node.children).filter(c => c.tagName === 'node').forEach(child => _highlightAllClickable(child));
+}
+
+// ── 缩放功能 ──────────────────────────────────────────────────────────────────
+let zoomScale = 1.0;
+
+function zoomIn() {
+    zoomScale = Math.min(zoomScale + 0.25, 4.0);
+    applyZoom();
+}
+
+function zoomOut() {
+    zoomScale = Math.max(zoomScale - 0.25, 0.25);
+    applyZoom();
+}
+
+function resetZoom() {
+    zoomScale = 1.0;
+    applyZoom();
+}
+
+function applyZoom() {
+    const label = document.getElementById('zoomLabel');
+    if (zoomScale === 1.0) {
+        canvas.classList.remove('original-size');
+        canvas.style.width = '';
+        canvas.style.height = '';
+    } else {
+        canvas.classList.add('original-size');
+        canvas.style.width = (canvas.width * zoomScale) + 'px';
+        canvas.style.height = (canvas.height * zoomScale) + 'px';
+    }
+    if (label) label.textContent = Math.round(zoomScale * 100) + '%';
+}
+
+// ── APK 安装辅助弹窗 ───────────────────────────────────────────────────────────
+function showApkInstallModal() {
+    const modal = document.getElementById('apkInstallModal');
+    if (!modal) return;
+    const progress = document.getElementById('apkInstallProgress');
+    const result   = document.getElementById('apkInstallResult');
+    const reconnect = document.getElementById('btnApkReconnect');
+    const btnNormal   = document.getElementById('btnInstallNormal');
+    const btnNoStream = document.getElementById('btnInstallNoStream');
+    if (progress)  progress.style.display = 'none';
+    if (result)  { result.style.display = 'none'; result.textContent = ''; }
+    if (reconnect) reconnect.style.display = 'none';
+    if (btnNormal)   btnNormal.disabled = false;
+    if (btnNoStream) btnNoStream.disabled = false;
+    modal.classList.add('show');
+}
+
+function closeApkInstallModal(event) {
+    if (event && event.target !== document.getElementById('apkInstallModal')) return;
+    document.getElementById('apkInstallModal')?.classList.remove('show');
+}
+
+async function doInstallApk(noStreaming) {
+    const progress  = document.getElementById('apkInstallProgress');
+    const result    = document.getElementById('apkInstallResult');
+    const reconnect = document.getElementById('btnApkReconnect');
+    const btnNormal   = document.getElementById('btnInstallNormal');
+    const btnNoStream = document.getElementById('btnInstallNoStream');
+    if (progress)  progress.style.display = 'block';
+    if (result)  { result.style.display = 'none'; result.textContent = ''; }
+    if (reconnect) reconnect.style.display = 'none';
+    if (btnNormal)   btnNormal.disabled = true;
+    if (btnNoStream) btnNoStream.disabled = true;
+    try {
+        const resp = await fetchWithTimeout('/api/accessibility/install-apk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serial: currentDevice?.serial, no_streaming: noStreaming })
+        }, 90000);
+        const data = await resp.json();
+        if (result) {
+            result.style.display = 'block';
+            result.textContent = data.output || data.error || JSON.stringify(data);
+        }
+        if (data.success && reconnect) reconnect.style.display = 'block';
+    } catch (e) {
+        if (result) { result.style.display = 'block'; result.textContent = '安装失败：' + e.message; }
+    } finally {
+        if (progress) progress.style.display = 'none';
+        if (btnNormal)   btnNormal.disabled = false;
+        if (btnNoStream) btnNoStream.disabled = false;
+    }
+}
+
+// ── 轻量级非阻塞通知 ──────────────────────────────────────────────────────────
+function showNotice(msg, type = 'info', duration = 4000) {
+    const container = document.getElementById('noticeContainer');
+    if (!container) { console.warn('[Notice]', msg); return; }
+    const iconMap  = { info: 'ℹ️', success: '✅', warning: '⚠️', error: '❌' };
+    const colorMap = { info: '#60a5fa', success: '#34d399', warning: '#fbbf24', error: '#f87171' };
+    const bar = document.createElement('div');
+    bar.className = 'notice-bar';
+    bar.style.borderLeftColor = colorMap[type] || colorMap.info;
+    bar.innerHTML = `
+        <span class="notice-icon">${iconMap[type] || iconMap.info}</span>
+        <span class="notice-msg">${msg}</span>
+        <button class="notice-close" onclick="this.parentElement.remove()">×</button>
+    `;
+    container.appendChild(bar);
+    requestAnimationFrame(() => requestAnimationFrame(() => bar.classList.add('visible')));
+    if (duration > 0) {
+        setTimeout(() => {
+            bar.classList.remove('visible');
+            setTimeout(() => bar.remove(), 300);
+        }, duration);
+    }
+}
+
+// ── 按键面板 ──────────────────────────────────────────────────────────────────
+async function sendKey(keyName) {
+    if (!currentDevice) { showNotice('请先连接设备', 'warning'); return; }
+    try {
+        await fetchWithTimeout('/api/send_key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device: currentDevice.serial, key: keyName })
+        }, 5000);
+    } catch (e) {
+        showNotice('发送按键失败: ' + e.message, 'error');
+    }
+}
+
+// ── UI 树过滤 ─────────────────────────────────────────────────────────────────
+// 判断一个 .tree-content 是否匹配查询词（节点文本 / resource-id / content-desc）
+function _contentMatchesQuery(content, q) {
+    const textEl = content.querySelector('.node-text');
+    if ((textEl?.innerText || '').toLowerCase().includes(q)) return true;
+    if ((content.dataset.resourceId || '').toLowerCase().includes(q)) return true;
+    if ((content.dataset.contentDesc || '').toLowerCase().includes(q)) return true;
+    return false;
+}
+
+function filterTreeNodes(query) {
+    const clearBtn = document.getElementById('treeFilterClearBtn');
+    if (clearBtn) clearBtn.style.display = query ? 'inline-flex' : 'none';
+    const q = (query || '').trim().toLowerCase();
+    if (!q) {
+        document.querySelectorAll('#tree-container .tree-node').forEach(node => { node.style.display = ''; });
+        return;
+    }
+    document.querySelectorAll('#tree-container .tree-content').forEach(content => {
+        const treeNode = content.parentElement;
+        if (!treeNode) return;
+        if (!_contentMatchesQuery(content, q)) {
+            treeNode.style.display = 'none';
+        } else {
+            treeNode.style.display = '';
+            let ancestor = treeNode.parentElement;
+            while (ancestor && ancestor.id !== 'tree-container') {
+                if (ancestor.classList.contains('tree-node') || ancestor.classList.contains('children-container')) {
+                    ancestor.style.display = '';
+                }
+                ancestor = ancestor.parentElement;
+            }
+        }
+    });
+}
+
+function clearTreeFilter() {
+    const input = document.getElementById('treeFilter');
+    if (input) input.value = '';
+    filterTreeNodes('');
+}
+
+function expandAllTree() {
+    document.querySelectorAll('#tree-container .children-container').forEach(el => { el.style.display = 'block'; });
+    document.querySelectorAll('#tree-container .toggle-btn').forEach(btn => { if (btn.innerText === '+') btn.innerText = '-'; });
+}
+
+function collapseAllTree() {
+    document.querySelectorAll('#tree-container .children-container').forEach(el => { el.style.display = 'none'; });
+    document.querySelectorAll('#tree-container .toggle-btn').forEach(btn => { if (btn.innerText === '-') btn.innerText = '+'; });
+}
+
+// ── 回车跳转：多匹配时弹选择弹窗 ─────────────────────────────────────────────
+function findAndJumpToNode(query) {
+    const q = (query || '').trim().toLowerCase();
+    if (!q) return;
+    const matches = [];
+    document.querySelectorAll('#tree-container .tree-content').forEach(content => {
+        if (_contentMatchesQuery(content, q)) matches.push(content);
+    });
+    if (matches.length === 0) { showNotice('未找到匹配节点', 'warning', 2000); return; }
+    if (matches.length === 1) {
+        const xmlNode = matches[0]._xmlNode;
+        if (xmlNode) selectNode(xmlNode);
+        return;
+    }
+    showNodePickerDialog(matches, q);
+}
+
+function showNodePickerDialog(matches, query) {
+    const dialog = document.getElementById('nodePickerDialog');
+    const list   = document.getElementById('nodePickerList');
+    const count  = document.getElementById('nodePickerCount');
+    if (!dialog || !list) return;
+    if (count) count.textContent = `找到 ${matches.length} 个匹配节点`;
+    list.innerHTML = '';
+
+    function escHtml(s) {
+        return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function hl(text, q) {
+        if (!text || !q) return escHtml(text);
+        const idx = text.toLowerCase().indexOf(q);
+        if (idx === -1) return escHtml(text);
+        return escHtml(text.slice(0, idx))
+            + `<mark class="picker-hl">${escHtml(text.slice(idx, idx + q.length))}</mark>`
+            + escHtml(text.slice(idx + q.length));
+    }
+
+    matches.forEach((content, idx) => {
+        const xmlNode = content._xmlNode;
+        const attrs   = xmlNode ? getAttributes(xmlNode) : {};
+        const cls     = attrs['class'] || '';
+        const shortCls = cls.includes('.') ? cls.split('.').pop() : cls;
+        const rid    = content.dataset.resourceId || '';
+        const cdesc  = content.dataset.contentDesc || '';
+        const txt    = attrs['text'] || '';
+        const bounds = attrs['bounds'] || '';
+
+        const item = document.createElement('div');
+        item.className = 'node-picker-item';
+        item.innerHTML = `
+            <div class="picker-index">${idx + 1}</div>
+            <div class="picker-detail">
+                <div class="picker-cls">${hl(shortCls, query)}</div>
+                ${rid   ? `<div class="picker-attr"><span class="picker-key">id</span>${hl(rid, query)}</div>` : ''}
+                ${cdesc ? `<div class="picker-attr"><span class="picker-key">desc</span>${hl(cdesc, query)}</div>` : ''}
+                ${txt   ? `<div class="picker-attr"><span class="picker-key">text</span>${hl(txt, query)}</div>` : ''}
+                ${bounds ? `<div class="picker-bounds">${bounds}</div>` : ''}
+            </div>`;
+        item.onclick = () => {
+            if (xmlNode) selectNode(xmlNode);
+            closeNodePickerDialog();
+        };
+        list.appendChild(item);
+    });
+    dialog.classList.add('show');
+}
+
+function closeNodePickerDialog() {
+    document.getElementById('nodePickerDialog')?.classList.remove('show');
+}
+
+// ─── 按键浮层面板 ────────────────────────────────────────────────────────────
+function toggleKeyPanel() {
+    const panel = document.getElementById('keyPanel');
+    if (!panel) return;
+
+    const isHidden = panel.classList.contains('hidden');
+    if (isHidden) {
+        // 定位到触发按钮正下方
+        const btn = document.querySelector('[onclick="toggleKeyPanel()"]');
+        if (btn) {
+            const rect = btn.getBoundingClientRect();
+            panel.style.left = rect.left + 'px';
+            panel.style.top  = (rect.bottom + 6) + 'px';
+        }
+        panel.classList.remove('hidden');
+
+        // 点击面板外部自动关闭
+        function onOutsideClick(e) {
+            const btn2 = document.querySelector('[onclick="toggleKeyPanel()"]');
+            if (!panel.contains(e.target) && e.target !== btn2) {
+                panel.classList.add('hidden');
+                document.removeEventListener('mousedown', onOutsideClick, true);
+            }
+        }
+        // 延迟注册，避免触发当前点击
+        setTimeout(() => document.addEventListener('mousedown', onOutsideClick, true), 0);
+    } else {
+        panel.classList.add('hidden');
+    }
 }

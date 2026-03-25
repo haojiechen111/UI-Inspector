@@ -40,6 +40,79 @@ object PythonServerManager {
     private var shouldMonitor = false
     private var pluginPathCache: String? = null
 
+    /**
+     * 直接通过 File.exists()/canExecute() 探测各候选目录，返回第一个可用的 Python 可执行文件完整路径。
+     *
+     * 优先级：pyenv > Homebrew(ARM) > python.org Framework > Homebrew(Intel) > conda > 系统 Python
+     *
+     * 为什么不用 PATH 注入？
+     * 从 Finder/Launchpad 启动的 Android Studio 在 macOS 上，即使向子进程 ProcessBuilder 注入了
+     * 额外 PATH，macOS 的 execvp 路径解析有时仍会优先命中 /usr/bin/python3（Xcode CLT 3.9.6）。
+     * 直接用完整路径调用可完全绕过这一问题。
+     */
+    private fun findPythonExecutable(): String {
+        val home = System.getProperty("user.home") ?: ""
+        // 候选 Python 完整路径，优先级从高到低
+        val candidates = listOf(
+            // pyenv shims（用户主动管理的版本，最高优先级）
+            "$home/.pyenv/shims/python3",
+            // Homebrew – Apple Silicon (M1/M2/M3)
+            "/opt/homebrew/bin/python3",
+            // python.org 官方安装包 Framework（新版优先）
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+            // Homebrew – Intel Mac
+            "/usr/local/bin/python3",
+            // conda / miniforge
+            "$home/miniforge3/bin/python3",
+            "$home/miniconda3/bin/python3",
+            "$home/anaconda3/bin/python3",
+            "$home/opt/anaconda3/bin/python3",
+            // python.org 老版本 Framework
+            "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+            // 系统 Python（Xcode CLT，兜底）
+            "/usr/bin/python3",
+        )
+        for (path in candidates) {
+            val f = File(path)
+            if (f.exists() && f.canExecute()) {
+                LOG.info("Found Python executable: $path")
+                return path
+            }
+        }
+        // Linux / 不在已知路径的情况：回退到命令名，依赖 PATH
+        LOG.warn("No Python found in known paths, falling back to 'python3'")
+        return "python3"
+    }
+
+    /**
+     * 构建带 ADB 路径注入的 ProcessBuilder（Python 路径由 findPythonExecutable() 决定，不再依赖此处 PATH）。
+     */
+    private fun buildProcessBuilder(vararg command: String): ProcessBuilder {
+        val pb = ProcessBuilder(*command)
+        val env = pb.environment()
+        val currentPath = env["PATH"] ?: ""
+        val home = System.getProperty("user.home") ?: ""
+        // 仅追加 ADB 常见路径（Python 已由 findPythonExecutable 处理）
+        val extraPaths = listOf(
+            "$home/Library/Android/sdk/platform-tools",
+            "$home/Android/Sdk/platform-tools",
+            "/Applications/Android Studio.app/Contents/platform-tools",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+        )
+        val mergedPath = (extraPaths + currentPath.split(File.pathSeparator))
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString(File.pathSeparator)
+        env["PATH"] = mergedPath
+        LOG.info("ProcessBuilder PATH: $mergedPath")
+        return pb
+    }
+
     private const val RESTART_FLAG_FILE = "restart_requested.flag"
 
     private fun getRestartFlagFile(): File? {
@@ -123,49 +196,40 @@ object PythonServerManager {
             )
         }
 
-        // 尝试python3
-        var pythonCmd = "python3"
+        // 直接用完整路径找到 Python（绕开 macOS PATH 解析问题）
+        val pythonExecutable = findPythonExecutable()
+        LOG.info("checkDependencies using Python: $pythonExecutable")
         var process: Process? = null
         
         try {
-            val pb = ProcessBuilder(pythonCmd, checkScript.absolutePath)
+            val pb = buildProcessBuilder(pythonExecutable, checkScript.absolutePath)
             pb.directory(serverDir)
             pb.redirectErrorStream(true)
             process = pb.start()
         } catch (e: Exception) {
-            LOG.info("python3 not found, trying python: ${e.message}")
-            // 尝试python
-            try {
-                pythonCmd = "python"
-                val pb = ProcessBuilder(pythonCmd, checkScript.absolutePath)
-                pb.directory(serverDir)
-                pb.redirectErrorStream(true)
-                process = pb.start()
-            } catch (e2: Exception) {
-                LOG.error("Both python3 and python not found: ${e2.message}")
-                return DependencyCheckResult(
-                    success = false,
-                    pythonVersion = null,
-                    pythonVersionFromCmd = null,
-                    pythonOk = false,
-                    missingPackages = emptyList(),
-                    missingPackagesWithCmd = emptyMap(),
-                    errorMessage = "未找到Python命令。请确保已安装Python 3.7+并添加到系统PATH。",
-                    osType = null,
-                    osName = null,
-                    pipCmd = null,
-                    pipMethods = emptyList(),
-                    pipOk = false,
-                    adbOk = false,
-                    adbPath = null,
-                    adbVersion = null,
-                    adbError = null,
-                    adbCandidates = emptyList(),
-                    installAllCmd = null,
-                    recommendations = listOf("请先安装 Python 3.7+ 并配置 PATH", "请确认 Android Platform-Tools(adb) 已安装并配置 PATH"),
-                    sysPath = emptyList()
-                )
-            }
+            LOG.error("Failed to start dependency check: ${e.message}")
+            return DependencyCheckResult(
+                success = false,
+                pythonVersion = null,
+                pythonVersionFromCmd = null,
+                pythonOk = false,
+                missingPackages = emptyList(),
+                missingPackagesWithCmd = emptyMap(),
+                errorMessage = "未找到Python命令（尝试路径: $pythonExecutable）。请确保已安装Python 3.7+。",
+                osType = null,
+                osName = null,
+                pipCmd = null,
+                pipMethods = emptyList(),
+                pipOk = false,
+                adbOk = false,
+                adbPath = null,
+                adbVersion = null,
+                adbError = null,
+                adbCandidates = emptyList(),
+                installAllCmd = null,
+                recommendations = listOf("请先安装 Python 3.7+ 并配置 PATH", "请确认 Android Platform-Tools(adb) 已安装并配置 PATH"),
+                sysPath = emptyList()
+            )
         }
 
         // 读取检查结果
@@ -409,7 +473,10 @@ object PythonServerManager {
         val logFile = File(serverDir, "server_log.txt")
         LOG.info("Starting Car UI Server. Logs at: ${logFile.absolutePath}")
 
-        val pb = ProcessBuilder("python3", "main.py")
+        // 用完整路径启动 Python（绕开 macOS PATH 解析问题）
+        val pythonExecutable = findPythonExecutable()
+        LOG.info("start() using Python: $pythonExecutable")
+        val pb = buildProcessBuilder(pythonExecutable, "main.py")
         pb.directory(serverDir)
         pb.redirectErrorStream(true)
         pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
@@ -422,23 +489,9 @@ object PythonServerManager {
             }
             return null
         } catch (e: Exception) {
-            LOG.error("Failed to start with 'python3', trying 'python': ${e.message}")
-            try {
-               val pb2 = ProcessBuilder("python", "main.py")
-               pb2.directory(serverDir)
-               pb2.redirectErrorStream(true)
-               pb2.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
-               process = pb2.start()
-               LOG.info("Server process started successfully with 'python'")
-               if (enableMonitoring) {
-                   startMonitoring()
-               }
-               return null
-            } catch (e2: Exception) {
-               val error = "Python启动失败：${e2.message}"
-               LOG.error(error)
-               return error
-            }
+            val error = "Python启动失败（路径: $pythonExecutable）：${e.message}"
+            LOG.error(error)
+            return error
         }
     }
 
