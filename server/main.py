@@ -326,14 +326,40 @@ def api_diagnose_secure():
 def _parse_displays_from_dumpsys(dump_out: str) -> List[Dict]:
     """从 dumpsys display 输出中解析逻辑 display 列表（含分辨率）。
 
-    主要策略：
-    1. 按 "Display Device" 块拆分，从每块提取 mDisplayId + 分辨率
-    2. 若块解析失败，fallback 到全文 mDisplayId= 扫描
+    策略优先级：
+    1. 解析 mViewports 行（含 type/displayId/分辨率/displayName），过滤 VIRTUAL
+       适用于新版 Android（输出格式含 DisplayViewport{...}）
+    2. 按 "Display Device\\n" 块拆分，从每块提取 mDisplayId + 分辨率
+       适用于 Android 10 旧格式
+    3. Fallback：全文 mDisplayId= 扫描（无分辨率，兜底）
     """
     result: List[Dict] = []
     seen: set = set()
 
-    # 按 "Display Device" 块切分（Android 10+ 格式）
+    # ── 策略 1：解析 mViewports 行 ────────────────────────────────────
+    # 格式：DisplayViewport{type=INTERNAL, ..., displayId=0, ...,
+    #         deviceWidth=6296, deviceHeight=1740, displayName=DP_0}
+    # VIRTUAL 类型为 scrcpy / 投屏虚拟屏，直接跳过
+    viewport_pat = re.compile(
+        r"DisplayViewport\{type=(\w+)[^}]*?"
+        r"displayId=(\d+)[^}]*?"
+        r"deviceWidth=(\d+),\s*deviceHeight=(\d+),\s*displayName=([^,}\s]+)"
+    )
+    for m in viewport_pat.finditer(dump_out):
+        vtype, did, w, h, name = (
+            m.group(1), m.group(2), m.group(3), m.group(4), m.group(5).strip()
+        )
+        if vtype == "VIRTUAL":
+            continue  # 过滤 scrcpy 等虚拟屏
+        if did in seen:
+            continue
+        seen.add(did)
+        result.append({"id": did, "description": f"Display {did} {w}x{h} [{name}]"})
+
+    if result:
+        return sorted(result, key=lambda x: int(x["id"]))
+
+    # ── 策略 2：按 "Display Device" 块切分（Android 10 旧格式）────────
     blocks = re.split(r"Display Device\s+", dump_out)
     for block in blocks[1:]:
         id_m = re.search(r"mDisplayId=(\d+)", block)
@@ -348,13 +374,15 @@ def _parse_displays_from_dumpsys(dump_out: str) -> List[Dict]:
         res_str = f" {res_m.group(1)}x{res_m.group(2)}" if res_m else ""
         result.append({"id": did, "description": f"Display {did}{res_str}"})
 
-    # Fallback: 全文扫描 mDisplayId=N（无分辨率信息）
-    if not result:
-        for m in re.finditer(r"mDisplayId=(\d+)", dump_out):
-            did = m.group(1)
-            if did not in seen:
-                seen.add(did)
-                result.append({"id": did, "description": f"Display {did}"})
+    if result:
+        return sorted(result, key=lambda x: int(x["id"]))
+
+    # ── 策略 3：Fallback 全文扫描 mDisplayId=N（无分辨率）────────────
+    for m in re.finditer(r"mDisplayId=(\d+)", dump_out):
+        did = m.group(1)
+        if did not in seen:
+            seen.add(did)
+            result.append({"id": did, "description": f"Display {did}"})
 
     return sorted(result, key=lambda x: int(x["id"]))
 
@@ -387,14 +415,26 @@ def refresh_display_mapping(serial: str):
                 r"Display (\d{10,20}).*?displayName=\"([^\"]+)\"", sf_output
             ))
             new_mapping: Dict[str, str] = {}
-            for m in re.finditer(r"mDisplayId=(\d+).*?mUniqueId=local:(\d{10,20})", dump_out, re.DOTALL):
+            # ⚠️ 优先从 DisplayViewport 行提取（同一行内 displayId= 和 uniqueId= 相邻，最可靠）
+            # 格式：DisplayViewport{..., displayId=4, ..., uniqueId='local:4630947039749296163', ...}
+            # 这台 SS4 设备 screencap -d 只接受物理 uniqueId，不接受 logical displayId
+            for m in re.finditer(r"displayId=(\d+)[^}]*?uniqueId='local:(\d+)'", dump_out):
                 logical, physical = m.group(1), m.group(2)
                 new_mapping[logical] = physical
+                print(f"[DISPLAY_MAPPING] 📍 logical {logical} → physical {physical}")
+            # fallback：旧格式 mDisplayId=N ... mUniqueId=local:XXXXX（跨行，部分设备适用）
+            if not new_mapping:
+                _last_logical = None
+                _last_physical = None
+                for m in re.finditer(r"mDisplayId=(\d+).*?mUniqueId=local:(\d{10,20})", dump_out, re.DOTALL):
+                    _last_logical, _last_physical = m.group(1), m.group(2)
+                    new_mapping[_last_logical] = _last_physical
                 # 用物理屏名称覆盖描述（可选，不覆盖分辨率）
-                if physical in phys_to_name:
-                    name = phys_to_name[physical]
+                # 注意：仅当循环至少执行过一次（_last_physical 不为 None）时才访问
+                if _last_physical and _last_physical in phys_to_name:
+                    name = phys_to_name[_last_physical]
                     for item in info_list:
-                        if item["id"] == logical and name:
+                        if item["id"] == _last_logical and name:
                             # 保留分辨率后缀
                             res_suffix = re.search(r"(\s+\d+x\d+)$", item["description"])
                             item["description"] = f"{name}{res_suffix.group(1) if res_suffix else ''}"
@@ -599,6 +639,13 @@ def init_ss4_device(req: SS4InitRequest):
 def get_displays(serial: Optional[str] = None):
     global current_serial, display_info_cache, ss4_localhost_mapping
     target_serial = serial or current_serial
+
+    # ⚠️ 关键修复：/api/displays 被前端直接带 serial 调用（如 ?serial=localhost:5559），
+    # 但 /api/screenshot 等接口依赖全局 current_serial。
+    # 若前端没有单独调用 /api/connect，current_serial 会始终为空，导致截图返回 400。
+    if serial and serial != current_serial:
+        current_serial = serial
+        print(f"[DISPLAYS] 🔗 更新 current_serial = {serial}")
     
     if not target_serial:
         return []
@@ -760,33 +807,43 @@ def get_screenshot(display: str = "0"):
                 cmd_variations.append(f"screencap -d {phys_id} -p")
                 cmd_variations.append(f"screencap -p -d {phys_id}")
 
-        # 使用adbutils执行命令（更快更稳定）
+        # 使用adbutils执行命令
+        # ⚠️ 注意：必须用 encoding=None 获取原始 bytes，否则 adbutils 2.x 默认 UTF-8 解码会损坏 PNG 高字节
         for cmd_str in cmd_variations:
             try:
                 print(f"[SCREENSHOT] 🔧 尝试命令: {cmd_str}")
-                # 注意：不同版本的adbutils对shell()的返回值处理不同
-                # 新版本返回bytes，旧版本可能返回str
-                res = d.shell(cmd_str)
-                # 如果返回的是字符串，转换为bytes
+                res = d.shell(cmd_str, encoding=None)  # encoding=None → 返回 bytes，避免 UTF-8 损坏二进制
                 if isinstance(res, str):
-                    res = res.encode('latin1')
+                    res = res.encode('latin1')  # 兼容旧版 adbutils 返回 str 的情况
                 if res and len(res) > 100:
                     print(f"[SCREENSHOT] ✅ 成功！截图大小: {len(res)} bytes")
                     raw_png = res
                     break
                 else:
-                    print(f"[SCREENSHOT] ❌ 返回数据太小或为空: {len(res) if res else 0} bytes")
+                    err_text = res.decode('utf-8', errors='replace').strip() if res else ''
+                    print(f"[SCREENSHOT] ❌ 返回数据太小或为空: {len(res) if res else 0} bytes, 内容: {err_text[:100]}")
+                    last_err = err_text
             except Exception as e:
                 print(f"[SCREENSHOT] ❌ 命令失败: {e}")
                 last_err = str(e)
                 continue
 
         # Subprocess fallback（兜底方案）
+        # 优先使用 exec-out，它专为二进制输出设计，绕过 shell 终端协议，避免 PNG 数据被截断/乱码
         if not raw_png:
             print(f"[SCREENSHOT] 🔄 使用subprocess fallback")
             subprocess_variations = []
             
-            # 构建subprocess命令列表
+            # ── exec-out 变体（最高优先级，直接二进制流，不走 shell）──────────────────
+            # 对非 0 display 尤其重要：shell 协议可能截断二进制数据
+            if display != "0":
+                subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", display, "-p"])
+                if phys_id != display:
+                    subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", phys_id, "-p"])
+            else:
+                subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-p"])
+            
+            # ── 传统 shell 变体（兜底）──────────────────────────────────────────────
             if ss_type == "SS2":
                 if display == "0":
                     subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p"])
@@ -805,14 +862,15 @@ def get_screenshot(display: str = "0"):
             
             for cmd in subprocess_variations:
                 print(f"[SCREENSHOT] 🔧 subprocess尝试: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, check=False, timeout=10)
-                if result.returncode == 0 and result.stdout and len(result.stdout) > 100:
-                    print(f"[SCREENSHOT] ✅ subprocess成功！大小: {len(result.stdout)} bytes")
+                result = subprocess.run(cmd, capture_output=True, check=False, timeout=15)
+                if result.stdout and len(result.stdout) > 100:
+                    print(f"[SCREENSHOT] ✅ subprocess成功！大小: {len(result.stdout)} bytes (returncode={result.returncode})")
                     raw_png = result.stdout
                     break
-                if result.stderr:
-                    last_err = result.stderr.decode(errors='ignore')
-                    print(f"[SCREENSHOT] ❌ subprocess错误: {last_err}")
+                err_out = result.stderr.decode(errors='ignore').strip() if result.stderr else ''
+                if err_out:
+                    last_err = err_out
+                    print(f"[SCREENSHOT] ❌ subprocess错误 (rc={result.returncode}): {last_err[:200]}")
 
         if not raw_png:
              raise Exception(f"Failed to get screenshot for display {display} (Physical: {phys_id}). Last error: {last_err}")
@@ -1102,6 +1160,55 @@ def ensure_accessibility_service(
         result["error"] = str(e)
         return result
 
+def _get_display_bounds_from_dumpsys(serial: str, display: int):
+    """通过 dumpsys display 获取 Display N 的全局逻辑坐标范围。
+    返回 (x0, y0, x1, y1) 或 None。
+    SS4多SoC场景下用于识别 Display N 在全局坐标中的位置，从而按坐标过滤辅助服务节点。
+    """
+    try:
+        import re
+        result = subprocess.run(
+            ["adb", "-s", serial, "shell", "dumpsys", "display"],
+            capture_output=True, text=True, timeout=5
+        )
+        output = result.stdout
+
+        # 不同 Android 版本的 dumpsys display 输出格式不同，尝试多种定位方式
+        # 先找到 mDisplayId=N 的位置，在其后 3000 字符内查找坐标矩形
+        disp_idx = output.find(f"mDisplayId={display}")
+        if disp_idx < 0:
+            disp_idx = output.find(f"Display id {display}")
+        if disp_idx < 0:
+            print(f"[DisplayBounds] ⚠️ dumpsys display 中未找到 Display {display} 片段")
+            return None
+
+        # 截取 Display N 段落（最多 3000 字符，避免跨入下一 Display 段落）
+        segment = output[disp_idx:disp_idx + 3000]
+
+        # 尝试各种 Rect 格式匹配
+        patterns = [
+            # "logical Rect(x0, y0 - x1, y1)" 或 "logical frame Rect(...)"
+            re.compile(r'logical\s+(?:frame\s+)?Rect\((\d+),\s*(\d+)\s*-\s*(\d+),\s*(\d+)\)'),
+            # "displayRect=Rect(x0, y0 - x1, y1)"
+            re.compile(r'displayRect\s*=\s*Rect\((\d+),\s*(\d+)\s*-\s*(\d+),\s*(\d+)\)'),
+            # "bounds=Rect(x0, y0 - x1, y1)"
+            re.compile(r'bounds\s*=\s*Rect\((\d+),\s*(\d+)\s*-\s*(\d+),\s*(\d+)\)'),
+        ]
+        for pat in patterns:
+            m = pat.search(segment)
+            if m:
+                x0, y0, x1, y1 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                if x1 > x0 and y1 > y0:  # 合法矩形
+                    print(f"[DisplayBounds] Display {display} 全局范围: ({x0},{y0})-({x1},{y1})")
+                    return (x0, y0, x1, y1)
+
+        print(f"[DisplayBounds] ⚠️ 无法从 dumpsys display 中解析出 Display {display} 的坐标矩形")
+        return None
+    except Exception as e:
+        print(f"[DisplayBounds] ⚠️ dumpsys display 获取失败: {e}")
+        return None
+
+
 def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[str]:
     """从辅助服务获取UI树并转换为XML格式"""
     try:
@@ -1130,28 +1237,73 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
             return None
         
         nodes = data.get("nodes", [])
-        print(f"[Accessibility] ✅ 获取到 {len(nodes)} 个根节点")
-        
-        # --- 坐标归一化：将“全局坐标”转换为“当前 display 截图坐标系” ---
-        # 在多屏/分屏场景下，AccessibilityNodeInfo#getBoundsInScreen 可能返回带 display 偏移的坐标，
-        # 而 screencap -d <display> 的截图坐标原点是 (0,0)。
-        # 这里用该 display 的窗口 bounds 的最小 left/top 作为 display 的原点偏移，并对疑似“绝对坐标”的节点做减偏移。
-        origin_x = 0
-        origin_y = 0
-        try:
-            xs = []
-            ys = []
-            for rn in nodes:
-                wb = ((rn.get("window") or {}).get("bounds") or {})
-                if "left" in wb and "top" in wb:
-                    xs.append(int(wb.get("left", 0)))
-                    ys.append(int(wb.get("top", 0)))
-            if xs and ys:
-                origin_x = min(xs)
-                origin_y = min(ys)
-        except Exception:
+        display_fallback = data.get("displayFallback", False)
+        print(f"[Accessibility] ✅ 获取到 {len(nodes)} 个根节点 (displayFallback={display_fallback})")
+
+        # SS4多SoC兜底处理：APK无法找到 Display N 的专属窗口，返回了全部窗口节点。
+        # 直接把这些节点当作 Display N 的数据会把 Display 0 的内容错误地呈现给用户。
+        # 优先按 window.displayId 字段过滤，更准确；坐标过滤对于独立 DisplayGroup (origin=0,0) 无效。
+        if display_fallback and display != 0:
+            print(f"[Accessibility] ⚠️ displayFallback=True: APK在Display {display}无专属窗口，")
+            print(f"[Accessibility]    返回了全部display的节点，按 window.displayId={display} 过滤...")
+            # 优先按 displayId 精确过滤
+            nodes_by_id = [n for n in nodes if (n.get("window") or {}).get("displayId") == display]
+            if nodes_by_id:
+                print(f"[Accessibility]    ✅ 按displayId过滤后保留 {len(nodes_by_id)} 个Display {display}的节点")
+                nodes = nodes_by_id
+                origin_x, origin_y = 0, 0
+            else:
+                # displayId 字段无匹配：尝试坐标过滤（仅对有偏移的 display 有效）
+                print(f"[Accessibility]    ⚠️ 无 displayId={display} 的节点，尝试坐标范围过滤...")
+                display_bounds = _get_display_bounds_from_dumpsys(serial, display)
+                if display_bounds:
+                    dx0, dy0, dx1, dy1 = display_bounds
+                    # 仅当 display 有非零偏移时才做坐标过滤，否则无法区分 display 0 和独立 DisplayGroup
+                    if dx0 > 50 or dy0 > 50:
+                        print(f"[Accessibility]    Display {display} 全局范围: ({dx0},{dy0})-({dx1},{dy1})，按坐标过滤...")
+                        def _wnd_overlaps(node, _dx0=dx0, _dy0=dy0, _dx1=dx1, _dy1=dy1):
+                            wb = (node.get("window") or {}).get("bounds") or {}
+                            if not wb:
+                                return False
+                            wl, wt = int(wb.get("left", 0)), int(wb.get("top", 0))
+                            wr, wb2 = int(wb.get("right", 0)), int(wb.get("bottom", 0))
+                            return not (wr <= _dx0 or wl >= _dx1 or wb2 <= _dy0 or wt >= _dy1)
+                        nodes = [n for n in nodes if _wnd_overlaps(n)]
+                        if nodes:
+                            print(f"[Accessibility]    ✅ 坐标过滤后保留 {len(nodes)} 个节点")
+                            origin_x, origin_y = dx0, dy0
+                        else:
+                            print(f"[Accessibility]    ⚠️ 坐标过滤后无节点，主SoC无法访问Display {display}，返回None")
+                            return None
+                    else:
+                        print(f"[Accessibility]    ⚠️ Display {display} 坐标原点为(0,0)，无法按坐标区分，"
+                              f"主SoC辅助服务无法访问Display {display}，返回None（将fallback到UIAutomator）")
+                        return None
+                else:
+                    print(f"[Accessibility]    ⚠️ 无法获取Display {display}的坐标范围，"
+                          f"主SoC辅助服务无法访问Display {display}，返回None（将fallback到UIAutomator）")
+                    return None
+        else:
+            # --- 坐标归一化：将"全局坐标"转换为"当前 display 截图坐标系" ---
+            # 在多屏/分屏场景下，AccessibilityNodeInfo#getBoundsInScreen 可能返回带 display 偏移的坐标，
+            # 而 screencap -d <display> 的截图坐标原点是 (0,0)。
+            # 这里用该 display 的窗口 bounds 的最小 left/top 作为 display 的原点偏移，并对疑似"绝对坐标"的节点做减偏移。
             origin_x = 0
             origin_y = 0
+            try:
+                xs = []
+                ys = []
+                for rn in nodes:
+                    wb = ((rn.get("window") or {}).get("bounds") or {})
+                    if "left" in wb and "top" in wb:
+                        xs.append(int(wb.get("left", 0)))
+                        ys.append(int(wb.get("top", 0)))
+                if xs and ys:
+                    origin_x = min(xs)
+                    origin_y = min(ys)
+            except Exception:
+                origin_x = 0
+                origin_y = 0
 
         def normalize_bounds(b: Dict) -> Dict:
             """按需将 bounds 从全局坐标转换为 display 内坐标。"""
@@ -1280,9 +1432,12 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
 
         if check_accessibility_service(target_serial):
             xml_from_accessibility = get_hierarchy_from_accessibility(target_serial, display)
-            if xml_from_accessibility:
+            # 必须包含实际节点才算有效，空 hierarchy 不能直接返回（要 fallback 到 UIAutomator）
+            if xml_from_accessibility and '<node' in xml_from_accessibility:
                 print(f"[Hierarchy] ✅ 使用辅助服务数据源")
                 return {"xml": xml_from_accessibility, "source": "accessibility"}
+            elif xml_from_accessibility:
+                print(f"[Hierarchy] ⚠️ 辅助服务返回空节点树（display={display}），fallback到UIAutomator")
             else:
                 print(f"[Hierarchy] ⚠️ 辅助服务获取失败，fallback到UIAutomator")
         else:
@@ -1299,43 +1454,69 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
         # Clear previous dump
         d.shell(f"rm -f {dump_path}")
         
-        # 获取所有display的完整hierarchy（使用--windows获取多窗口多display数据）
-        # 某些车机上 uiautomator dump 会偶发报：ERROR: could not get idle state.
-        # 这里做重试，并优先使用 --compressed 降低数据量。
-        print(f"[Hierarchy] 🔍 获取所有display的完整层级数据...")
+        # ──────────────────────────────────────────────────────────────────────
+        # 获取 hierarchy 策略：
+        #   Display 0  → 优先 --windows（含多窗口叠加），失败再 --display 0
+        #   非主屏      → 优先 --display N（坐标系与截图完全一致），失败再 --windows+过滤
+        # 这样可避免 SS4 多屏场景下 --windows 不含 Display 4 导致树为空的问题。
+        # ──────────────────────────────────────────────────────────────────────
+        import time
+        xml_content = ""
         dump_err = ""
-        for attempt in range(3):
-            try:
-                cmd = f"uiautomator dump --compressed --windows {dump_path}"
-                dump_err = d.shell(cmd)
-                print(f"[Hierarchy] uiautomator dump输出(attempt {attempt+1}/3): {dump_err}")
-                xml_content = d.shell(f"cat {dump_path}")
-                if xml_content and "<?xml" in xml_content:
-                    break
-            except Exception as _e:
-                dump_err = str(_e)
-            import time
-            time.sleep(0.3)
 
-        # 读取dump的内容（若上面已经读取并成功，会走到这里继续使用）
-        if 'xml_content' not in locals():
-            xml_content = d.shell(f"cat {dump_path}")
-        
-        if not xml_content or "<?xml" not in xml_content:
-            print(f"[Hierarchy] --windows方式失败,尝试指定display...")
-            # Fallback: 尝试指定display
-            d.shell(f"rm -f {dump_path}")
-            # 也做一次重试
+        if display == 0:
+            # ── Display 0: --windows 优先 ──────────────────────────────────────
+            print(f"[Hierarchy] 🔍 Display 0: 使用 --windows 获取多窗口层级...")
+            for attempt in range(3):
+                try:
+                    cmd = f"uiautomator dump --compressed --windows {dump_path}"
+                    dump_err = d.shell(cmd)
+                    print(f"[Hierarchy] --windows 输出(attempt {attempt+1}/3): {dump_err}")
+                    xml_content = d.shell(f"cat {dump_path}")
+                    if xml_content and "<?xml" in xml_content:
+                        break
+                except Exception as _e:
+                    dump_err = str(_e)
+                time.sleep(0.3)
+
+            if not xml_content or "<?xml" not in xml_content:
+                print(f"[Hierarchy] ⚠️ --windows 失败，fallback 到 --display 0...")
+                d.shell(f"rm -f {dump_path}")
+                for attempt in range(3):
+                    err = d.shell(f"uiautomator dump --compressed --display 0 {dump_path}")
+                    print(f"[Hierarchy] --display 0 fallback 输出(attempt {attempt+1}/3): {err}")
+                    xml_content = d.shell(f"cat {dump_path}")
+                    if xml_content and "<?xml" in xml_content:
+                        break
+                    time.sleep(0.3)
+        else:
+            # ── 非主屏: --display N 优先（坐标系与 screencap 一致，无需转换） ──
+            print(f"[Hierarchy] 🎯 非主屏 Display {display}: 直接使用 --display 方式（坐标与截图一致）...")
             for attempt in range(3):
                 cmd = f"uiautomator dump --compressed --display {display} {dump_path}"
-                err = d.shell(cmd)
-                print(f"[Hierarchy] uiautomator dump(display)输出(attempt {attempt+1}/3): {err}")
+                dump_err = d.shell(cmd)
+                print(f"[Hierarchy] --display {display} 输出(attempt {attempt+1}/3): {dump_err}")
                 xml_content = d.shell(f"cat {dump_path}")
                 if xml_content and "<?xml" in xml_content:
                     break
-                import time
                 time.sleep(0.3)
-            
+
+            if not xml_content or "<?xml" not in xml_content:
+                # fallback: --windows 并依赖后续过滤
+                print(f"[Hierarchy] ⚠️ --display {display} 失败，fallback 到 --windows+过滤...")
+                d.shell(f"rm -f {dump_path}")
+                for attempt in range(3):
+                    try:
+                        cmd = f"uiautomator dump --compressed --windows {dump_path}"
+                        dump_err = d.shell(cmd)
+                        print(f"[Hierarchy] --windows fallback 输出(attempt {attempt+1}/3): {dump_err}")
+                        xml_content = d.shell(f"cat {dump_path}")
+                        if xml_content and "<?xml" in xml_content:
+                            break
+                    except Exception as _e:
+                        dump_err = str(_e)
+                    time.sleep(0.3)
+
         if not xml_content or "<?xml" not in xml_content:
             raise Exception(f"Failed to dump hierarchy for display {display}")
 
@@ -1585,23 +1766,32 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
                                         print(f"[Hierarchy]          🎯 决策: {'需要转换' if should_transform else '不转换'} - {reason}")
                                         
                                         if should_transform:
-                                            # 相对坐标，需要转换
+                                            # 相对坐标（local坐标系），需要缩放但不加全局偏移
+                                            # Fix C: 节点已在local坐标系，offset不应加 dst_bounds['x1']
                                             src_w = max(1, src_union['x2'] - src_union['x1'])
                                             src_h = max(1, src_union['y2'] - src_union['y1'])
                                             dst_w = max(1, dst_bounds['x2'] - dst_bounds['x1'])
                                             dst_h = max(1, dst_bounds['y2'] - dst_bounds['y1'])
                                             scale_x = dst_w / src_w
                                             scale_y = dst_h / src_h
-                                            offset_x = dst_bounds['x1'] - src_union['x1'] * scale_x
-                                            offset_y = dst_bounds['y1'] - src_union['y1'] * scale_y
-                                            print(f"[Hierarchy]          ✅ 应用转换: scale=({scale_x:.4f},{scale_y:.4f}), offset=({offset_x:.1f},{offset_y:.1f})")
+                                            # 目标是将节点对齐到 local(0,0)，不加全局window起点偏移
+                                            offset_x = 0.0 - src_union['x1'] * scale_x
+                                            offset_y = 0.0 - src_union['y1'] * scale_y
+                                            print(f"[Hierarchy]          ✅ 应用转换(本地输出): scale=({scale_x:.4f},{scale_y:.4f}), offset=({offset_x:.1f},{offset_y:.1f})")
                                         else:
-                                            # 已经是绝对坐标，不转换
+                                            # 节点是全局绝对坐标，不缩放
                                             scale_x = 1.0
                                             scale_y = 1.0
-                                            offset_x = 0.0
-                                            offset_y = 0.0
-                                            print(f"[Hierarchy]          ✅ 保持原坐标")
+                                            # Fix B: 若 window 本身有全局偏移（x1>100），需减去 window 原点
+                                            # 将全局坐标平移为 display 本地坐标
+                                            if dst_bounds and (dst_bounds['x1'] > 100 or dst_bounds['y1'] > 100):
+                                                offset_x = -float(dst_bounds['x1'])
+                                                offset_y = -float(dst_bounds['y1'])
+                                                print(f"[Hierarchy]          🔄 全局→本地平移: offset=({offset_x:.0f},{offset_y:.0f})")
+                                            else:
+                                                offset_x = 0.0
+                                                offset_y = 0.0
+                                                print(f"[Hierarchy]          ✅ 保持原坐标")
 
                                     transform_node_bounds(node_copy, scale_x, scale_y, offset_x, offset_y)
                                     fix_zero_bounds_for_actionable_nodes(node_copy, None)
@@ -1651,6 +1841,105 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
                     print(f"[Hierarchy] 顶层节点数: {len(first_nodes)}")
                     for i, node in enumerate(first_nodes[:3]):  # 打印前3个
                         print(f"[Hierarchy]   节点{i}: class={node.get('class')}, bounds={node.get('bounds')}")
+
+                # ── 非主屏坐标变换 ─────────────────────────────────────────────
+                # SS4 的 uiautomator dump --display N 实际返回 Display 0 的全局坐标系
+                # （例如 Display 0=6296x1740，而 Display 4=3840x2160）
+                # 需要把 bounds 从 Display 0 的全局坐标映射到 Display N 的本地坐标（0,0 起点）
+                if display != 0 and first_nodes:
+                    try:
+                        # Fix A: 先获取目标 display 分辨率，再计算是否需要变换
+                        # 若 display_info_cache 为空（如用户只调了 /connect 未调 /displays），
+                        # 自动触发一次 refresh 填充缓存，确保坐标变换有据可依
+                        if not display_info_cache and current_serial:
+                            print(f"[Hierarchy] ⚠️ display_info_cache 为空，自动刷新...")
+                            refresh_display_mapping(current_serial)
+
+                        target_w, target_h = None, None
+                        for di in display_info_cache:
+                            if di.get('id') == str(display):
+                                res_m = re.search(r'(\d+)x(\d+)', di.get('description', ''))
+                                if res_m:
+                                    target_w = int(res_m.group(1))
+                                    target_h = int(res_m.group(2))
+                                    break
+
+                        # 收集所有顶层节点的非零 bounds，计算全局坐标包围盒
+                        top_bounds = [parse_bounds(n.get('bounds', '')) for n in first_nodes]
+                        top_bounds = [b for b in top_bounds if b and not is_zero_bounds(b)]
+                        if top_bounds:
+                            src_x_min = min(b['x1'] for b in top_bounds)
+                            src_y_min = min(b['y1'] for b in top_bounds)
+                            src_x_max = max(b['x2'] for b in top_bounds)
+                            src_y_max = max(b['y2'] for b in top_bounds)
+                            span_w = src_x_max - src_x_min
+                            span_h = src_y_max - src_y_min
+
+                            # 条件1: 起点偏离原点（全局坐标系有偏移，需要平移）
+                            offset_remap = src_x_min > 50 or src_y_min > 50
+
+                            # 条件2: 跨度"超出"期望分辨率（>20%），说明 bounds 来自更大的坐标系
+                            # 例如 Display 4 但 bounds 来自 Display 0（6296×1740）→ span_w=6296>3840×1.2 → 缩放
+                            # 条件2b: 坐标系"偏小"（UIAutomator 使用了不同的逻辑分辨率）
+                            # 例如 Display 4（3840×2160），UIAutomator 返回 [20,0][2691,1740]（y_max=Display0高度）
+                            # 此时 h_ratio=1740/2160=0.806 < 1.0，不触发旧条件，但节点会"到不了底"
+                            # 判断条件：根节点贴近原点（y_min≤10, x_min≤100）且两轴均偏小（<0.9）
+                            scale_remap = False
+                            if target_w and target_h and span_w > 100 and span_h > 100:
+                                w_ratio = span_w / target_w
+                                h_ratio = span_h / target_h
+                                if w_ratio > 1.2 or h_ratio > 1.2:
+                                    # 坐标系比目标大 → 缩小
+                                    scale_remap = True
+                                    print(f"[Hierarchy] ⚠️ 坐标系超出期望: 节点范围 {span_w}x{span_h}"
+                                          f" > 期望 {target_w}x{target_h}"
+                                          f" (ratio={w_ratio:.2f}x{h_ratio:.2f})")
+                                elif (w_ratio < 0.9 and h_ratio < 0.9
+                                      and src_y_min <= 10 and src_x_min <= 100):
+                                    # 坐标系比目标小 → 放大（UIAutomator 使用了不同的逻辑分辨率）
+                                    # 额外条件：根节点贴近原点，说明这是"全屏"坐标系而非局部小窗口
+                                    scale_remap = True
+                                    print(f"[Hierarchy] ⚠️ 坐标空间偏小: 节点范围 {span_w}x{span_h}"
+                                          f" < 期望 {target_w}x{target_h}"
+                                          f" (ratio={w_ratio:.2f}x{h_ratio:.2f}),"
+                                          f" 根节点起点[{src_x_min},{src_y_min}]贴近原点,"
+                                          f" 触发放大变换")
+
+                            needs_remap = offset_remap or scale_remap
+                            print(f"[Hierarchy] 📐 Display {display} bounds 包围盒:"
+                                  f" [{src_x_min},{src_y_min}][{src_x_max},{src_y_max}],"
+                                  f" offset_remap={offset_remap},"
+                                  f" scale_remap={scale_remap},"
+                                  f" 需要变换={needs_remap}")
+
+                            if needs_remap:
+                                if scale_remap and target_w and target_h:
+                                    # 跨度超出目标分辨率：按目标分辨率缩放（来自不同/更大坐标系）
+                                    src_w = max(1, span_w)
+                                    src_h = max(1, span_h)
+                                    sc_x = target_w / src_w
+                                    sc_y = target_h / src_h
+                                    off_x = -src_x_min * sc_x
+                                    off_y = -src_y_min * sc_y
+                                    print(f"[Hierarchy] 🔄 缩放+平移变换: [{src_x_min},{src_y_min}][{src_x_max},{src_y_max}] → [0,0][{target_w},{target_h}]")
+                                    print(f"[Hierarchy] 🔢 scale=({sc_x:.4f},{sc_y:.4f}), offset=({off_x:.1f},{off_y:.1f})")
+                                elif offset_remap:
+                                    # 起点偏移但跨度正常：只做平移，不缩放
+                                    # （坐标系与目标一致，只是起点在全局坐标中有偏移）
+                                    sc_x = 1.0
+                                    sc_y = 1.0
+                                    off_x = -float(src_x_min)
+                                    off_y = -float(src_y_min)
+                                    print(f"[Hierarchy] 🔄 纯平移变换: offset=({off_x:.0f},{off_y:.0f})")
+                                # 对所有顶层节点（及其子树）应用变换
+                                for n in root:
+                                    if n.tag == 'node':
+                                        transform_node_bounds(n, sc_x, sc_y, off_x, off_y)
+                                xml_content = ET.tostring(root, encoding='unicode')
+                                xml_content = '<?xml version="1.0" encoding="UTF-8"?>' + xml_content
+                                print(f"[Hierarchy] ✅ 坐标变换完成，XML长度: {len(xml_content)}")
+                    except Exception as _remap_err:
+                        print(f"[Hierarchy] ⚠️ 非主屏坐标变换异常: {_remap_err}")
             else:
                 print(f"[Hierarchy] ⚠️ 未知根标签: {root.tag}")
                 
@@ -1942,6 +2231,19 @@ def api_install_apk(req: InstallApkRequest):
     result = _adb_run(cmd, timeout=90)
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     success = result.returncode == 0
+
+    # 签名不匹配时自动先卸载再安装（INSTALL_FAILED_UPDATE_INCOMPATIBLE）
+    if not success and "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in output:
+        print(f"[InstallAPK] ⚠️ 签名不匹配，自动卸载旧版本再重装...")
+        uninstall_r = _adb_run(["adb", "-s", serial, "uninstall", "com.carui.accessibility"], timeout=15)
+        uninstall_out = ((uninstall_r.stdout or "") + (uninstall_r.stderr or "")).strip()
+        print(f"[InstallAPK] 卸载结果: {uninstall_out}")
+        # 重新安装
+        result2 = _adb_run(cmd, timeout=90)
+        output2 = ((result2.stdout or "") + (result2.stderr or "")).strip()
+        success = result2.returncode == 0
+        output = f"[自动卸载旧版] {uninstall_out}\n[重新安装] {output2}"
+
     return {
         "success": success,
         "output": output,
