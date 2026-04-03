@@ -652,6 +652,10 @@ function updateDisplayModalList() {
         item.onclick = () => {
             selectDisplay(d.id, d.description);
             closeDisplayModal();
+            // 用户手动选择 display 后，立即刷新截图和层级数据以显示新屏幕内容
+            if (currentDevice) {
+                refreshSnapshot();
+            }
         };
         
         listContainer.appendChild(item);
@@ -688,14 +692,13 @@ function selectDisplay(displayId, description) {
         btn.style.transform = 'scale(1)';
     }, 100);
     
-    // 只是选择display，不自动连接或刷新
-    console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description, "- 需要点击'连接设备'按钮才会连接");
+    console.log("[SelectDisplay] 已选择显示屏幕:", displayId, description);
 }
 
 // 启用/禁用display选择器
 function enableDisplaySelector() {
     const displayBtn = document.getElementById('displaySelectBtn');
-    const displayRefreshBtn = displayBtn.nextElementSibling; // 刷新按钮
+    const displayRefreshBtn = displayBtn ? displayBtn.nextElementSibling : null; // 刷新按钮
     
     if (displayBtn) {
         displayBtn.disabled = false;
@@ -716,7 +719,7 @@ function enableDisplaySelector() {
 function disableDisplaySelector() {
     const displayBtn = document.getElementById('displaySelectBtn');
     const displayText = document.getElementById('displaySelectText');
-    const displayRefreshBtn = displayBtn.nextElementSibling; // 刷新按钮
+    const displayRefreshBtn = displayBtn ? displayBtn.nextElementSibling : null; // 刷新按钮
     
     if (displayBtn) {
         displayBtn.disabled = true;
@@ -765,6 +768,23 @@ window.onload = () => {
             // 如果已连接设备，刷新hierarchy以使用新的数据源
             if (rootNode) {
                 console.log('[DataSource] ⚠️ 数据源已更改，刷新后将使用新的数据源');
+                refreshHierarchy();
+            }
+        });
+    }
+
+    // 监听"融合 display10"开关变化 - 打开/关闭时立即刷新节点树
+    const mergeVirtualSwitch = document.getElementById('mergeVirtualDisplay');
+    if (mergeVirtualSwitch) {
+        mergeVirtualSwitch.addEventListener('change', function() {
+            const useAccessibility = document.getElementById('useAccessibilityService')?.checked ?? false;
+            if (this.checked && !useAccessibility) {
+                // 仅辅助服务模式下有效，给用户提示
+                console.warn('[MergeVirtual] 融合 display10 需要辅助服务模式，请先开启辅助服务开关');
+                showNotice('⚠️ 融合 display10 需要开启「辅助服务」模式才能生效', 'warning', 3000);
+            }
+            if (rootNode) {
+                console.log(`[MergeVirtual] 融合开关已${this.checked ? '开启' : '关闭'}，刷新节点树...`);
                 refreshHierarchy();
             }
         });
@@ -891,6 +911,11 @@ async function refreshDeviceList(autoConnect = false) {
         
         // 仅在明确请求自动连接时才连接（点击刷新按钮时）
         if (autoConnect) {
+            if (!currentDevice) {
+                console.warn('[AutoConnect] 无法自动连接：当前未选择设备');
+                btn.innerText = `请选择设备 (${devicesList.length}个)`;
+                return;
+            }
             console.log(`[AutoConnect] 用户请求自动连接到: ${currentDevice.serial}`);
             
             clearLog();
@@ -961,6 +986,12 @@ async function refreshDisplayList(keepCurrentSelection = false) {
             // 否则选择第一个display（初次加载或用户选择的display不存在了）
             currentDisplay = displaysList[0].id;
             selectDisplay(displaysList[0].id, displaysList[0].description);
+            // display 发生了切换时（如SS4首次连接 display "0"→"2"，或手动刷新列表后第一个变了），
+            // 若设备已连接则立即刷新截图，避免屏幕停留在旧 display 的内容
+            if (currentDevice && currentDisplay !== previousDisplay) {
+                console.log("[RefreshDisplayList] display已变更，触发截图刷新:", previousDisplay, "→", currentDisplay);
+                refreshSnapshot();
+            }
         }
     } catch (e) {
         console.error("Failed to get displays", e);
@@ -1122,7 +1153,7 @@ async function connectDevice() {
                 } else {
                     addLogEntry('⚠️ 无障碍APK未安装（可能是 adb/权限/serial 问题）', 'warning');
                     // APK 未安装 → 弹出手动安装引导弹窗
-                    showApkInstallModal();
+                    showApkInstallModal('APK 尚未安装到设备（自动安装失败，可能是 adb 权限或 serial 问题）。<br>请手动选择安装方式：');
                 }
             } else {
                 const errText = await ensureApkRes.text();
@@ -1240,8 +1271,11 @@ async function updateAccessibilityUIStatus() {
     if (!data.enabled || !data.running) {
         addLogEntry(`⚠️ 辅助服务异常：${enabledText} / ${runningText}`, 'warning');
         addLogEntry('💡 建议：到系统"无障碍"里打开 CarUI Accessibility；或重启服务后重连', 'info');
-        // 辅助服务未运行 → 弹出 APK 安装/引导弹窗
-        showApkInstallModal();
+        // 辅助服务未运行 → 弹出 APK 安装/引导弹窗（附带实际状态说明）
+        const modalMsg = data.enabled
+            ? `APK 已安装且辅助服务<b>已在 Settings 中启用</b>，但 HTTP 端口 8765 未响应。<br>可能原因：服务崩溃、端口占用、或需要手动在设置中重新切换开关。<br>如仍无法自动启动，请尝试重新安装 APK：`
+            : `辅助服务<b>未在 Settings 中启用</b>（Settings 写入可能失败，需 root 权限）。<br>请重新安装 APK 后手动到「设置 &gt; 无障碍」中开启 CarUI Accessibility：`;
+        showApkInstallModal(modalMsg);
     } else {
         addLogEntry('✅ 辅助服务运行正常', 'success');
     }
@@ -1286,7 +1320,11 @@ async function refreshSnapshot(forceShowLoading = true) {
     }
 }
 
-function refreshScreen() {
+function refreshScreen(fromAutoRetry = false) {
+    // 用户主动触发刷新时，重置黑屏自动重试标记，允许下次截图再次触发自动重试
+    if (!fromAutoRetry) {
+        window._blackScreenRetryDone = false;
+    }
     return new Promise((resolve) => {
         const displayId = currentDisplay || "0";
         const img = new Image();
@@ -1301,10 +1339,32 @@ function refreshScreen() {
                 if (img.decode) await img.decode();
                 screenImage = img;
 
-                // Canvas内部尺寸直接使用设备分辨率，不需要2x缩放
-                // 这样hierarchy的bounds坐标就能直接对应到Canvas坐标
-                canvas.width = screenImage.naturalWidth;
-                canvas.height = screenImage.naturalHeight;
+                // Canvas内部尺寸限制：JCEF 内嵌 Chromium 的 GPU 纹理高度上限约 1080~2048
+                // 超过该限制时 drawImage 只渲染前 N 行，其余显示为黑色（非 PNG 截断问题）
+                // 解决：将 canvas 缩小到安全范围，drawScreen 中用 ctx.scale 还原设备坐标系
+                //
+                // ⚠️ 旧方案用 Math.max(W,H) 只限最大边，但 JCEF GPU 纹理限制是针对"高度"的。
+                //    对于宽度超标的图（如 4096x1080），缩放后 canvas 高度 = 1080（安全）；
+                //    但对于高度超标的竖屏或正方形图（如 720x1920），旧方案缩放后高度 = 1920，
+                //    可能仍然超过 JCEF 的实际高度限制，导致下半部分黑屏。
+                // 修复：分别对宽度和高度设置上限，高度限制更保守（1536），避免黑屏一半。
+                const JCEF_MAX_CANVAS_W = 2048;   // 宽度上限（宽松）
+                const JCEF_MAX_CANVAS_H = 1536;   // 高度上限（保守，避免 JCEF GPU 纹理限制）
+                const _rawW = screenImage.naturalWidth, _rawH = screenImage.naturalHeight;
+                const _csW = _rawW > 0 ? JCEF_MAX_CANVAS_W / _rawW : 1.0;
+                const _csH = _rawH > 0 ? JCEF_MAX_CANVAS_H / _rawH : 1.0;
+                const _cs = Math.min(1.0, _csW, _csH);
+                const _newW = Math.round(_rawW * _cs);
+                const _newH = Math.round(_rawH * _cs);
+                // ⚠️ 只有尺寸真正变化时才修改 canvas 尺寸
+                // 修改 canvas.width / canvas.height 会立即清空画布（Canvas API 规范），
+                // 导致新图片还未 drawImage 前的这一帧显示为黑色（偶发黑屏闪烁）
+                if (canvas.width !== _newW || canvas.height !== _newH) {
+                    canvas.width = _newW;
+                    canvas.height = _newH;
+                }
+                window._screenCanvasScale = _cs;
+                if (_cs < 1.0) console.log(`[Canvas] 🔽 大尺寸截图 ${_rawW}x${_rawH} → canvas ${canvas.width}x${canvas.height} (scale=${_cs.toFixed(3)})`);
 
                 ctx.imageSmoothingEnabled = true;
                 ctx.imageSmoothingQuality = 'high';
@@ -1319,7 +1379,11 @@ function refreshScreen() {
             }
         };
         img.onerror = () => {
-            console.warn("无法获取截图");
+            console.warn(`[Screenshot] ❌ 无法获取 Display ${displayId} 的截图`);
+            // 如果是非 0 display 失败，给用户一个轻提示，避免"毫无反应"
+            if (displayId !== "0") {
+                showNotice(`⚠️ Display ${displayId} 截图失败，请确认该屏幕存在且可截图`, 'warning', 5000);
+            }
             resolve();
         };
     });
@@ -1341,12 +1405,15 @@ function drawScreen() {
     if (!screenImage.src) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // 渲染截图 (填满整个Canvas)
+    // 渲染截图（直接缩放到 canvas 大小；canvas 可能已被缩小以避免 JCEF 纹理限制）
     ctx.drawImage(screenImage, 0, 0, canvas.width, canvas.height);
 
     // 绘制 UI 高亮
-    // Canvas内部尺寸 = 设备分辨率，所以scale = 1，不需要缩放
+    // 若 canvas 被缩小（_screenCanvasScale < 1），需要 scale 变换将设备坐标（bounds）映射到 canvas 坐标
+    // 例如 3840x2160 → canvas 2048x1152（scale=0.533），bounds 坐标 (1000,500) → canvas 坐标 (533,267)
+    const cs = window._screenCanvasScale || 1.0;
     ctx.save();
+    if (cs !== 1.0) ctx.scale(cs, cs);
 
     // Draw Hover
     if (hoverNode && hoverNode !== selectedNode) {
@@ -1436,14 +1503,16 @@ async function diagnoseSecureIfNeeded() {
 }
 
 async function updateSecureWarningByScreenshot() {
-    // Decide based on black ratio.
-    // Note: some UIs have large black background, so we only warn when ratio is extremely high.
+    // 黑屏检测：分三档处理
+    // ① ratio >= 0.985：几乎全黑 → 诊断 secure layer
+    // ② ratio >= 0.35 ：部分黑屏（地图/视频 SurfaceView 硬件层） → 自动重试一次
+    // ③ ratio < 0.35  ：正常
     const ratio = computeBlackRatioFromCanvas(25);
     if (ratio == null) return;
     lastScreenshotBlackRatio = ratio;
 
-    // If it's mostly black, we further diagnose.
     if (ratio >= 0.985) {
+        // 几乎全黑：走原有的 secure layer 诊断
         const diag = await diagnoseSecureIfNeeded();
         if (diag && diag.has_secure_layer) {
             const top = (diag.resumed_activities || []).slice(-1)[0] || '';
@@ -1454,23 +1523,51 @@ async function updateSecureWarningByScreenshot() {
                 (top ? `<br/><small>前台: ${top}</small>` : '') +
                 (layer ? `<br/><small>Secure Layer: ${layer}</small>` : '')
             );
-            // Also tag in status area
             statusTags.set('capture', '截图受限');
             renderStatus();
         } else {
-            // unknown black screen
             showSecureWarning('⚠️ 截图几乎全黑：可能是抓错 display、或该页面走了 Overlay/受保护渲染。');
             statusTags.set('capture', '截图异常');
             renderStatus();
         }
+    } else if (ratio >= 0.35) {
+        // 部分黑屏：地图/视频 SurfaceView 使用硬件图层，screencap 偶发捕获失败
+        if (!window._blackScreenRetryDone) {
+            // 首次检测到 → 自动重试一次（延迟 400ms，规避 screencap 时序问题）
+            window._blackScreenRetryDone = true;
+            const pct = (ratio * 100).toFixed(0);
+            showSecureWarning(`⚫ 截图约 ${pct}% 区域为黑色，正在自动重试截图...`);
+            statusTags.set('capture', '截图重试中');
+            renderStatus();
+            setTimeout(async () => {
+                await refreshScreen(true); // fromAutoRetry=true，不重置重试标记
+            }, 400);
+        } else {
+            // 已自动重试过仍有黑区 → 显示持久提示 + 手动重试按钮
+            const pct = (ratio * 100).toFixed(0);
+            showSecureWarning(
+                `⚫ 截图约 ${pct}% 区域为黑色` +
+                `<br/><small>原因：地图/视频/SurfaceView 使用硬件图层，Android screencap 无法稳定捕获。节点树检测不受影响。</small>` +
+                `<br/><button onclick="manualRetryScreenshot()" style="margin-top:4px;padding:2px 10px;cursor:pointer;` +
+                `background:#3b82f6;color:white;border:none;border-radius:3px;font-size:11px;">🔄 手动重试截图</button>`
+            );
+            statusTags.set('capture', '截图有黑区');
+            renderStatus();
+        }
     } else {
-        // looks fine
+        // 正常截图
         hideSecureWarning();
         if (statusTags.has('capture')) {
             statusTags.delete('capture');
             renderStatus();
         }
     }
+}
+
+// 手动重试截图（重置重试标记，允许再次触发自动重试流程）
+function manualRetryScreenshot() {
+    window._blackScreenRetryDone = false;
+    refreshScreen();
 }
 
 // 绘制点击位置的红色十字准星（仅准星，不显示坐标文字）
@@ -1522,8 +1619,11 @@ function updateCoordDisplay(x, y) {
 async function refreshHierarchy() {
     try {
         const displayId = currentDisplay || "0";
-        const useAccessibility = document.getElementById('useAccessibilityService').checked;
-        const res = await fetch(`/api/hierarchy?display=${displayId}&force_accessibility=${useAccessibility}`);
+        const useAccessibility = document.getElementById('useAccessibilityService')?.checked ?? false;
+        // 融合虚拟 display(如 display=10)到主屏 SurfaceView 下，仅辅助服务模式有效
+        const mergeEnabled = useAccessibility && (document.getElementById('mergeVirtualDisplay')?.checked ?? false);
+        const mergeDisplayId = mergeEnabled ? 10 : -1;
+        const res = await fetch(`/api/hierarchy?display=${displayId}&force_accessibility=${useAccessibility}&merge_virtual_display=${mergeDisplayId}&t=${Date.now()}`);
         if (!res.ok) return;
         const data = await res.json();
         const parser = new DOMParser();
@@ -1539,7 +1639,16 @@ async function refreshHierarchy() {
 
         // 显示数据源信息
         if (data.source) {
-            const sourceText = data.source === 'accessibility' ? '辅助服务' : 'UIAutomator';
+            const useAccessibilityMode = document.getElementById('useAccessibilityService')?.checked ?? false;
+            // 辅助服务模式下 fallback 到 UIAutomator，显示"回退"标识，避免与[辅助服务:运行中]同时显示造成混淆
+            let sourceText;
+            if (data.source === 'accessibility') {
+                sourceText = '辅助服务';
+            } else if (useAccessibilityMode) {
+                sourceText = 'UIAutomator(回退)';  // 辅助服务开关打开但数据来自 UIAutomator
+            } else {
+                sourceText = 'UIAutomator';
+            }
             const reason = data.reason || '';
             let sourceMsg = `📊 数据源: ${sourceText}`;
             
@@ -1547,6 +1656,10 @@ async function refreshHierarchy() {
                 sourceMsg += ' (UIAutomator数据不完整，自动切换)';
             } else if (reason === 'uiautomator_failed') {
                 sourceMsg += ' (UIAutomator失败，使用辅助服务)';
+            } else if (reason === 'ss4_display_filter') {
+                sourceMsg += ' (SS4多屏坐标过滤)';
+            } else if (useAccessibilityMode && data.source !== 'accessibility') {
+                sourceMsg += ' (辅助服务无法获取此Display节点，已回退)';
             }
             
             console.log(`[Hierarchy] ${sourceMsg}`);
@@ -1838,7 +1951,16 @@ function renderProperties(attrs) {
     const table = document.createElement('table');
     table.id = 'props-table';
     let html = '';
-    const sortedKeys = Object.keys(attrs).sort();
+    // 优先展示的属性顺序
+    const PRIORITY_KEYS = [
+        'package', 'resource-id', 'content-desc', 'text',
+        'clickable', 'visible-to-user', 'enabled', 'scrollable'
+    ];
+    const allKeys = Object.keys(attrs);
+    const sortedKeys = [
+        ...PRIORITY_KEYS.filter(k => allKeys.includes(k)),
+        ...allKeys.filter(k => !PRIORITY_KEYS.includes(k)).sort()
+    ];
     
     // 应用搜索高亮到属性面板 - 每个关键字独立配色
     const hasPatterns = searchSettings.patterns && searchSettings.patterns.length > 0;
@@ -1985,6 +2107,10 @@ canvas.onmousemove = (e) => {
 };
 
 canvas.onmouseup = (e) => {
+    // 仅处理左键（button 0）；右键由 contextmenu 事件单独处理（performRealBack）
+    // 若此处不过滤，右键会同时触发 contextmenu 和 handleClick，导致双重操作
+    if (e.button !== 0) return;
+
     const coords = getCanvasCoords(e);
     
     // 如果不是拖拽状态，处理为简单点击
@@ -2920,9 +3046,14 @@ function applyZoom() {
 }
 
 // ── APK 安装辅助弹窗 ───────────────────────────────────────────────────────────
-function showApkInstallModal() {
+function showApkInstallModal(msg) {
     const modal = document.getElementById('apkInstallModal');
     if (!modal) return;
+    // 动态更新提示文案（不同触发原因显示不同说明）
+    if (msg) {
+        const msgEl = document.getElementById('apkInstallMessage');
+        if (msgEl) msgEl.innerHTML = msg;
+    }
     const progress = document.getElementById('apkInstallProgress');
     const result   = document.getElementById('apkInstallResult');
     const reconnect = document.getElementById('btnApkReconnect');
@@ -3001,11 +3132,15 @@ function showNotice(msg, type = 'info', duration = 4000) {
 async function sendKey(keyName) {
     if (!currentDevice) { showNotice('请先连接设备', 'warning'); return; }
     try {
-        await fetchWithTimeout('/api/send_key', {
+        const resp = await fetchWithTimeout('/api/keyevent', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ device: currentDevice.serial, key: keyName })
+            body: JSON.stringify({ key: keyName, display: parseInt(currentDisplay || 0) })
         }, 5000);
+        if (resp && !resp.ok) {
+            const errText = await resp.text().catch(() => '');
+            showNotice('按键发送失败: ' + errText, 'error');
+        }
     } catch (e) {
         showNotice('发送按键失败: ' + e.message, 'error');
     }

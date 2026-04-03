@@ -42,6 +42,12 @@
                     <span class="slider"></span>
                     <span class="label-text" id="dataSourceLabel">辅助服务</span>
                 </label>
+                <!-- 融合虚拟 display 节点到 SurfaceView 下（仅辅助服务模式有效） -->
+                <label class="toggle-switch" id="mergeVirtualGroup" title="将虚拟 display(如 display=10)的节点融合到主屏 SurfaceView 下，需辅助服务模式" style="margin-left:10px;">
+                    <input type="checkbox" id="mergeVirtualDisplay">
+                    <span class="slider"></span>
+                    <span class="label-text" style="white-space:nowrap;">融合display10</span>
+                </label>
             </div>
             <button class="btn-primary" onclick="connectDevice()">连接设备</button>
             <span id="status" class="status-badge">未连接</span>
@@ -118,6 +124,7 @@
             <!-- Properties (Now Top, Larger) -->
             <div class="panel props-panel" id="propsPanel">
                 <div class="panel-header">
+                    <button onclick="refreshSnapshot()" title="刷新截图和节点树" style="padding:2px 8px;font-size:12px;cursor:pointer;background:#3b82f6;color:white;border:none;border-radius:4px;margin-right:6px;flex-shrink:0;">🔄</button>
                     <h2>属性详情</h2>
                 </div>
                 <div id="props-container">
@@ -293,9 +300,9 @@
                 <button class="modal-close" onclick="closeApkInstallModal()">×</button>
             </div>
             <div class="modal-body">
-                <p style="color:#f87171;margin-bottom:16px;">
-                    辅助服务已启用，但服务尚未运行。<br>
-                    请选择安装方式将 APK 安装到当前设备：
+                <p style="color:#f87171;margin-bottom:16px;" id="apkInstallMessageP">
+                    <span id="apkInstallMessage">辅助服务已启用，但服务尚未运行。<br>
+                    请选择安装方式将 APK 安装到当前设备：</span>
                 </p>
                 <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
                     <button class="btn-primary" id="btnInstallNormal" onclick="doInstallApk(false)">
@@ -328,8 +335,8 @@
         <button class="key-btn" onclick="sendKey('Back')">◀ 返回</button>
         <button class="key-btn" onclick="sendKey('Home')">⌂ 主页</button>
         <button class="key-btn" onclick="sendKey('Recents')">▣ 最近</button>
-        <button class="key-btn" onclick="sendKey('VolumeUp')">🔊 音量+</button>
-        <button class="key-btn" onclick="sendKey('VolumeDown')">🔉 音量-</button>
+        <button class="key-btn" onclick="sendKey('VOLUME_UP')">🔊 音量+</button>
+        <button class="key-btn" onclick="sendKey('VOLUME_DOWN')">🔉 音量-</button>
         <button class="key-btn" onclick="sendKey('Power')">⏻ 电源</button>
     </div>
 
@@ -345,7 +352,7 @@
     </div>
 
     <!-- bump version to avoid JCEF cache -->
-    <script src="app.js?v=22"></script>
+    <script src="app.js?v=25"></script>
 </body>
 
 </html>

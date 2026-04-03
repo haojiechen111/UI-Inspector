@@ -735,6 +735,23 @@ def connect_device(req: ConnectRequest):
         
         print(f"[CONNECT] ✅ 连接成功: {current_serial}, Model: {model}")
         
+        # ── 自动 adb root（车机/已root设备需要 root 才能写 secure settings）──
+        # best-effort：失败/不支持时只打印日志，不影响连接结果
+        try:
+            import time as _t_root
+            _root_r = subprocess.run(
+                ["adb", "-s", current_serial, "root"],
+                capture_output=True, text=True, timeout=10
+            )
+            _root_out = (_root_r.stdout or "").strip()
+            print(f"[CONNECT] adb root: rc={_root_r.returncode} -> {_root_out[:120]}")
+            # 若 adbd 正在重启（返回 "restarting adbd as root"），等 2s 让其重连
+            if _root_r.returncode == 0 and "restarting" in _root_out.lower():
+                print("[CONNECT] adbd 正在重启，等待 2s...")
+                _t_root.sleep(2)
+        except Exception as _re:
+            print(f"[CONNECT] adb root 尝试失败（忽略）: {_re}")
+        
         return {
             "status": "connected", 
             "serial": current_serial,
@@ -747,6 +764,67 @@ def connect_device(req: ConnectRequest):
     except Exception as e:
         print(f"[CONNECT] ❌ 连接失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+def _is_png_complete(data: bytes) -> bool:
+    """检查 PNG 数据是否完整有效，验证截图完整性。
+    大尺寸截图（如 SS4 Display 4: 3840x2160）通过 adb shell 协议传输时可能被截断，
+    导致前端 canvas 下半部分显示为黑色（background-color: #000）。
+
+    ⚠️ 旧实现只检查 b'IEND' in data[-50:]，太宽松：
+       PNG IEND chunk 是严格的 12 字节 \x00\x00\x00\x00IEND\xae\x42\x60\x82，
+       仅搜索 4 字节 "IEND" 可能被 IDAT 数据中的偶然字节序列误匹配，
+       导致截断的 PNG 通过检查，前端只渲染前 N 行，其余显示为黑色（"黑屏一半"）。
+    修复：使用 endswith() 检查完整 12 字节 IEND chunk，并验证 PNG 签名和数据量下限。
+    """
+    if not data or len(data) < 67:   # 最小有效 PNG（1×1 白色）约 67 字节
+        return False
+    # 完整的 IEND chunk：4字节长度=0 + 4字节类型"IEND" + 4字节CRC
+    IEND_CHUNK = b'\x00\x00\x00\x00IEND\xae\x42\x60\x82'
+    if not data.endswith(IEND_CHUNK):
+        return False
+    # 验证 PNG 签名存在（可能有前缀垃圾字节，用 find 而非 startswith）
+    PNG_SIG = b'\x89PNG\r\n\x1a\n'
+    if data.find(PNG_SIG) < 0:
+        return False
+    # 额外：根据 IHDR 宽高估算 PNG 最低数据量，防止"只有签名+空IDAT+IEND"的最小伪PNG通过
+    # 每行至少 1 字节（过滤字节）+ 压缩数据，极端情况下 PNG 大小 >= H + 57（固定开销）
+    try:
+        import struct as _s
+        idx = data.find(PNG_SIG)
+        png_data = data[idx:]
+        if len(png_data) >= 24:
+            h = _s.unpack('>I', png_data[20:24])[0]
+            if h > 0 and len(png_data) < h + 57:
+                return False  # 数据量连每行 1 字节都不够，肯定截断了
+    except Exception:
+        pass
+    return True
+
+
+def _get_png_size(data: bytes):
+    """从 PNG 数据头部解析图片尺寸，返回 (width, height) 或 (None, None)。
+    用于验证截图是否对应正确的 Display（防止 screencap -d N 实际返回了其他 display 的截图）。
+    PNG 格式：8字节签名 + IHDR chunk（4字节长度 + 4字节类型 + 4字节宽度 + 4字节高度 + ...）
+    Width 在签名后第 16-19 字节，Height 在第 20-23 字节（big-endian uint32）。"""
+    try:
+        import struct
+        if not data or len(data) < 24:
+            return None, None
+        # 找到 PNG 签名（可能前面有垃圾字节）
+        png_sig = b'\x89PNG\r\n\x1a\n'
+        idx = data.find(png_sig)
+        if idx < 0:
+            return None, None
+        # IHDR 数据区起始 = 签名8字节 + chunk长度4字节 + chunk类型4字节 = +16
+        start = idx + 16
+        if len(data) < start + 8:
+            return None, None
+        w = struct.unpack('>I', data[start:start + 4])[0]
+        h = struct.unpack('>I', data[start + 4:start + 8])[0]
+        return w, h
+    except Exception:
+        return None, None
+
 
 @app.get("/api/screenshot")
 def get_screenshot(display: str = "0"):
@@ -766,9 +844,23 @@ def get_screenshot(display: str = "0"):
         print(f"[SCREENSHOT] 🔄 物理ID映射: {display} -> {phys_id}")
         
         raw_png = None
+        best_png = None   # 完整但尺寸不符的截图，所有正确尺寸尝试失败后用作兜底
         last_err = ""
         d = adb.device(serial=current_serial)
-        
+
+        # 从 display_info_cache 获取期望的截图尺寸，用于验证截图是否对应正确的 display
+        # SS4 场景：screencap -d 4 有时实际返回 Display 0 的截图（3840x1740 而非 3840x2160），
+        # 导致前端下方显示黑色。通过检查 PNG 尺寸可以检测并重试。
+        _exp_w, _exp_h = None, None
+        for _di in display_info_cache:
+            if _di.get('id') == str(display):
+                _res_m = re.search(r'(\d+)x(\d+)', _di.get('description', ''))
+                if _res_m:
+                    _exp_w, _exp_h = int(_res_m.group(1)), int(_res_m.group(2))
+                    break
+        if _exp_w and _exp_h:
+            print(f"[SCREENSHOT] 📐 期望截图尺寸: {_exp_w}x{_exp_h}")
+
         # 优化的命令尝试顺序 - SS2MAX前后排设备都能正确截图
         cmd_variations = []
         
@@ -816,9 +908,30 @@ def get_screenshot(display: str = "0"):
                 if isinstance(res, str):
                     res = res.encode('latin1')  # 兼容旧版 adbutils 返回 str 的情况
                 if res and len(res) > 100:
-                    print(f"[SCREENSHOT] ✅ 成功！截图大小: {len(res)} bytes")
-                    raw_png = res
-                    break
+                    if _is_png_complete(res):
+                        # 验证截图尺寸是否符合期望（防止 screencap -d N 实际返回了其他 display 的截图）
+                        if _exp_w and _exp_h:
+                            _aw, _ah = _get_png_size(res)
+                            if _aw == _exp_w and _ah == _exp_h:
+                                print(f"[SCREENSHOT] ✅ 成功！截图大小: {len(res)} bytes, 尺寸: {_aw}x{_ah}")
+                                raw_png = res
+                                break
+                            elif _aw and _ah:
+                                print(f"[SCREENSHOT] ⚠️ 截图尺寸不符: 期望 {_exp_w}x{_exp_h}, 实际 {_aw}x{_ah}, 可能抓到了错误 display，继续尝试...")
+                                if best_png is None:
+                                    best_png = res  # 记录第一个完整但尺寸不对的截图
+                                last_err = f"size mismatch: got {_aw}x{_ah}, expected {_exp_w}x{_exp_h}"
+                            else:
+                                print(f"[SCREENSHOT] ✅ 成功（无法解析尺寸）！截图大小: {len(res)} bytes")
+                                raw_png = res
+                                break
+                        else:
+                            print(f"[SCREENSHOT] ✅ 成功！截图大小: {len(res)} bytes")
+                            raw_png = res
+                            break
+                    else:
+                        print(f"[SCREENSHOT] ⚠️ adbutils: PNG 数据不完整（缺少 IEND 尾块），继续尝试下一命令...")
+                        last_err = "PNG data incomplete (missing IEND chunk)"
                 else:
                     err_text = res.decode('utf-8', errors='replace').strip() if res else ''
                     print(f"[SCREENSHOT] ❌ 返回数据太小或为空: {len(res) if res else 0} bytes, 内容: {err_text[:100]}")
@@ -840,6 +953,9 @@ def get_screenshot(display: str = "0"):
                 subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", display, "-p"])
                 if phys_id != display:
                     subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", phys_id, "-p"])
+                    # local: 前缀变体：SS4 screencap 对长物理 ID 可能需要 local: 前缀
+                    if len(str(phys_id)) > 6:
+                        subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", f"local:{phys_id}", "-p"])
             else:
                 subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-p"])
             
@@ -864,13 +980,70 @@ def get_screenshot(display: str = "0"):
                 print(f"[SCREENSHOT] 🔧 subprocess尝试: {' '.join(cmd)}")
                 result = subprocess.run(cmd, capture_output=True, check=False, timeout=15)
                 if result.stdout and len(result.stdout) > 100:
-                    print(f"[SCREENSHOT] ✅ subprocess成功！大小: {len(result.stdout)} bytes (returncode={result.returncode})")
-                    raw_png = result.stdout
-                    break
+                    if _is_png_complete(result.stdout):
+                        if _exp_w and _exp_h:
+                            _aw, _ah = _get_png_size(result.stdout)
+                            if _aw == _exp_w and _ah == _exp_h:
+                                print(f"[SCREENSHOT] ✅ subprocess成功！大小: {len(result.stdout)} bytes, 尺寸: {_aw}x{_ah}")
+                                raw_png = result.stdout
+                                break
+                            elif _aw and _ah:
+                                print(f"[SCREENSHOT] ⚠️ subprocess截图尺寸不符: 期望 {_exp_w}x{_exp_h}, 实际 {_aw}x{_ah}，继续尝试...")
+                                if best_png is None:
+                                    best_png = result.stdout
+                                last_err = f"size mismatch: got {_aw}x{_ah}, expected {_exp_w}x{_exp_h}"
+                            else:
+                                print(f"[SCREENSHOT] ✅ subprocess成功（无法解析尺寸）！大小: {len(result.stdout)} bytes")
+                                raw_png = result.stdout
+                                break
+                        else:
+                            print(f"[SCREENSHOT] ✅ subprocess成功！大小: {len(result.stdout)} bytes (returncode={result.returncode})")
+                            raw_png = result.stdout
+                            break
+                    else:
+                        print(f"[SCREENSHOT] ⚠️ subprocess: PNG 数据不完整（缺少 IEND 尾块），继续尝试下一命令...")
+                        last_err = "PNG data incomplete (missing IEND chunk)"
                 err_out = result.stderr.decode(errors='ignore').strip() if result.stderr else ''
                 if err_out:
                     last_err = err_out
                     print(f"[SCREENSHOT] ❌ subprocess错误 (rc={result.returncode}): {last_err[:200]}")
+
+        # ── wm screenshot 兜底（Android 13+ 走不同截图路径，某些场景能捕获 screencap 漏掉的图层）──
+        if not raw_png:
+            try:
+                import time as _t
+                _wm_tmp = "/sdcard/.ui_insp_sc_tmp.png"
+                _wm_r = subprocess.run(
+                    ["adb", "-s", current_serial, "shell", f"wm screenshot {_wm_tmp}"],
+                    capture_output=True, check=False, timeout=8
+                )
+                _wm_stdout = (_wm_r.stdout or b"").decode("utf-8", errors="replace").strip()
+                # 成功标志：returncode 0，或输出为空（wm screenshot 成功时通常无输出）
+                if _wm_r.returncode == 0 or (not _wm_stdout) or "Written" in _wm_stdout:
+                    _pull_r = subprocess.run(
+                        ["adb", "-s", current_serial, "exec-out", f"cat {_wm_tmp}"],
+                        capture_output=True, check=False, timeout=10
+                    )
+                    # 后台删除临时文件（不等待）
+                    subprocess.Popen(
+                        ["adb", "-s", current_serial, "shell", f"rm -f {_wm_tmp}"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    if _pull_r.stdout and _is_png_complete(_pull_r.stdout):
+                        print(f"[SCREENSHOT] ✅ wm screenshot 兜底成功！大小: {len(_pull_r.stdout)} bytes")
+                        raw_png = _pull_r.stdout
+                    else:
+                        print(f"[SCREENSHOT] ⚠️ wm screenshot 数据不完整，跳过")
+                else:
+                    print(f"[SCREENSHOT] wm screenshot 不支持或失败 (rc={_wm_r.returncode}): {_wm_stdout[:80]}")
+            except Exception as _wm_e:
+                print(f"[SCREENSHOT] wm screenshot 尝试异常: {_wm_e}")
+
+        # 所有命令均未返回期望尺寸的截图：用兜底截图（完整但尺寸不符）代替报错
+        if not raw_png and best_png:
+            _bw, _bh = _get_png_size(best_png)
+            print(f"[SCREENSHOT] ⚠️ 所有命令均未返回期望尺寸 {_exp_w}x{_exp_h}，使用兜底截图: {_bw}x{_bh}")
+            raw_png = best_png
 
         if not raw_png:
              raise Exception(f"Failed to get screenshot for display {display} (Physical: {phys_id}). Last error: {last_err}")
@@ -901,8 +1074,11 @@ def check_accessibility_service(serial: str) -> bool:
             check=False,
         )
         if fw.returncode != 0:
-            print(f"[Accessibility] ⚠️ adb forward failed on {serial}: {fw.stderr.strip()}")
-        
+            # ⚠️ forward 失败（端口可能被另一台设备占用）→ 必须 return False！
+            # 不能继续做 HTTP 探测——否则会打到其他设备的 8765 服务，造成"误判已运行"。
+            print(f"[Accessibility] ⚠️ adb forward failed on {serial}: {fw.stderr.strip()} (返回 False，避免误用其他设备的服务)")
+            return False
+
         if requests is None:
             print("[Accessibility] ⚠️ Python requests not installed, cannot probe /api/status")
             return False
@@ -912,7 +1088,7 @@ def check_accessibility_service(serial: str) -> bool:
         if response.status_code == 200:
             data = response.json()
             if data.get("service") == "running":
-                print(f"[Accessibility] ✅ 辅助服务可用")
+                print(f"[Accessibility] ✅ 辅助服务可用 (serial={serial})")
                 return True
     except Exception as e:
         print(f"[Accessibility] ⚠️ 辅助服务不可用(serial={serial}): {e}")
@@ -951,6 +1127,11 @@ def probe_accessibility_service(serial: str) -> Dict:
         )
         info["forward_ok"] = fw.returncode == 0
         info["forward_stderr"] = (fw.stderr or "").strip()
+
+        if not info["forward_ok"]:
+            # ⚠️ forward 失败（端口被其他设备占用）→ 直接返回 False，避免 HTTP 打到其他设备
+            info["http_error"] = f"adb forward failed: {info['forward_stderr']}"
+            return info
 
         if requests is None:
             info["http_error"] = "python requests not installed"
@@ -1113,6 +1294,38 @@ def ensure_accessibility_service(
                 if last_pm_err:
                     step(f"pm path last error: {last_pm_err}")
 
+        # 2.5) adb root —— SS2/SS3 等车机必须 root 才能写 secure settings
+        # 普通已-root 设备会返回 "adbd is already running as root"，此步骤无害
+        step("Trying adb root (required for car ECUs to write secure settings)")
+        try:
+            import time as _time_root
+            root_r = _adb_run(["adb", "-s", target_serial, "root"], timeout=8)
+            root_out = (root_r.stdout or "").strip()
+            step(f"adb root: rc={root_r.returncode} -> {root_out[:120]}")
+            if root_r.returncode == 0 and "already" not in root_out.lower():
+                # daemon 重启 —— 需要等待 adbd 重新上线
+                # SS2/车机 adbd 重启可能需要 20~30s，固定 sleep(2) 不够
+                # 改为主动轮询 adb get-state，最多等待 30 秒
+                step("adbd restarting, polling for reconnect (up to 30s)...")
+                _time_root.sleep(2)  # 给 adbd 一点时间先断开
+                _reconnected = False
+                for _wait_i in range(28):
+                    try:
+                        _dev_r = _adb_run(["adb", "-s", target_serial, "get-state"], timeout=3)
+                        if _dev_r.returncode == 0 and "device" in (_dev_r.stdout or "").lower():
+                            step(f"adbd reconnected after ~{_wait_i + 2}s")
+                            _reconnected = True
+                            break
+                    except Exception:
+                        pass
+                    _time_root.sleep(1)
+                if not _reconnected:
+                    step("adbd reconnect polling timed out (30s), continuing anyway")
+            else:
+                _time_root.sleep(0.5)
+        except Exception as _root_e:
+            step(f"adb root exception: {_root_e} (continuing anyway)")
+
         # 3) Enable secure settings (optional)
         if enable_service:
             r = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
@@ -1134,6 +1347,28 @@ def ensure_accessibility_service(
             step(f"Enabled now? {result['enabled']}")
             if not result["enabled"]:
                 step("WARNING: enable may require root/WRITE_SECURE_SETTINGS; please enable manually in Settings")
+
+            # 3.1) Force-rebind: toggle accessibility_enabled 0→1
+            # 仅写入 enabled_accessibility_services 在某些车机上不会立即触发服务绑定，
+            # 需要切换 accessibility_enabled 来强制 AccessibilityManagerService 重新扫描。
+            step("Force-rebind: toggling accessibility_enabled 0→1 to nudge framework")
+            import time as _time_bind
+            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "0"], timeout=6)
+            _time_bind.sleep(1)
+            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+
+            # 3.2) cmd accessibility enable（Android 10+ / 部分车机支持，最强触发方式）
+            try:
+                _cmd_r = _adb_run(
+                    ["adb", "-s", target_serial, "shell", "cmd", "accessibility", "enable",
+                     "com.carui.accessibility/.CarUIAccessibilityService"],
+                    timeout=8,
+                )
+                _cmd_out = ((_cmd_r.stdout or "") + (_cmd_r.stderr or "")).strip()
+                step(f"cmd accessibility enable: rc={_cmd_r.returncode} -> {_cmd_out[:120]}")
+            except Exception as _cmd_e:
+                step(f"cmd accessibility enable: skipped ({_cmd_e})")
+
         else:
             step("Skip enabling service (enable_service=false)")
 
@@ -1143,7 +1378,7 @@ def ensure_accessibility_service(
 
             import time
             running = False
-            for _ in range(1, 9):
+            for _ in range(1, 33):  # 32×0.5s = 16s
                 if check_accessibility_service(target_serial):
                     running = True
                     break
@@ -1152,6 +1387,25 @@ def ensure_accessibility_service(
             step(f"Running? {running}")
             if not result["running"]:
                 step("WARNING: service not responding on 8765; please open Accessibility settings and toggle service")
+                # 诊断：进程是否存在 + 端口是否监听
+                try:
+                    _ps_out = (_adb_run(["adb", "-s", target_serial, "shell", "ps", "-A"], timeout=6).stdout or "")
+                    _has_proc = "carui" in _ps_out.lower()
+                    step(f"DIAG: carui process in ps? {_has_proc}")
+                    # 0x223D = 8765
+                    _net_out = (_adb_run(["adb", "-s", target_serial, "shell", "cat /proc/net/tcp6"], timeout=5).stdout or "")
+                    _port_up = "223D" in _net_out.upper()
+                    step(f"DIAG: port 8765 listening? {_port_up}")
+                    if _port_up and not running:
+                        step("DIAG: port up but HTTP not responding → re-forwarding")
+                        _fw2 = _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
+                        step(f"DIAG: re-forward rc={_fw2.returncode}")
+                        # 额外再探一次
+                        if check_accessibility_service(target_serial):
+                            result["running"] = True
+                            step("DIAG: service OK after re-forward!")
+                except Exception as _diag_e:
+                    step(f"DIAG error: {_diag_e}")
         else:
             step("Skip probing running status (probe_running=false)")
 
@@ -1389,6 +1643,203 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
         return None
 
 
+def inject_virtual_nodes_into_surfaceview(
+    primary_xml: str,
+    virtual_xml: str,
+    virtual_display: int,
+    virtual_w: Optional[int] = None,
+    virtual_h: Optional[int] = None,
+) -> str:
+    """将虚拟 display 的节点树注入到主 display XML 的 SurfaceView 节点下，并做坐标映射。
+
+    场景：
+      - 主 display（通常 display=0）的 UI 树中有一个 SurfaceView 节点，
+        其显示内容来自虚拟 display（如 displayId=10）。
+      - AccessibilityService 无法穿透 SurfaceView 获取其内部节点，
+        但可以单独查询虚拟 display 的节点树（需 API 33+ 或系统支持）。
+      - 本函数将虚拟 display 的顶层节点注入为 SurfaceView 的子节点，
+        同时将坐标从"虚拟 display 坐标系"映射到"SurfaceView 在主 display 中的位置"。
+
+    坐标变换公式（线性缩放 + 平移）：
+      scale_x = sv_w / virtual_w      (sv_w = SurfaceView 宽度，virtual_w = 虚拟 display 宽度)
+      scale_y = sv_h / virtual_h
+      new_x1  = sv_x1 + original_x1 * scale_x
+      new_y1  = sv_y1 + original_y1 * scale_y
+
+    参数：
+      primary_xml      主 display 的 XML 层级字符串（含 <?xml ...?> 头部）
+      virtual_xml      虚拟 display 的 XML 层级字符串
+      virtual_display  虚拟 display id，仅用于日志
+      virtual_w/h      虚拟 display 的逻辑分辨率；若为 None 则自动从缓存或节点推算
+
+    返回：
+      融合后的 XML 字符串；若注入失败则返回原始 primary_xml。
+    """
+    import xml.etree.ElementTree as ET
+    import re as _re
+
+    def _parse_b(s):
+        if not s:
+            return None
+        m = _re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', s)
+        return {'x1': int(m.group(1)), 'y1': int(m.group(2)),
+                'x2': int(m.group(3)), 'y2': int(m.group(4))} if m else None
+
+    def _fmt_b(x1, y1, x2, y2):
+        return f"[{x1},{y1}][{x2},{y2}]"
+
+    def _strip_decl(xml_str):
+        s = xml_str.strip()
+        if s.startswith('<?xml'):
+            return s[s.find('?>') + 2:].lstrip()
+        return s
+
+    def _transform_recursive(node, sv_b, vw, vh):
+        """递归将虚拟 display 坐标映射到 SurfaceView 所在的主 display 坐标空间。"""
+        b = _parse_b(node.get('bounds'))
+        if b and sv_b and vw and vh:
+            sw = sv_b['x2'] - sv_b['x1']
+            sh = sv_b['y2'] - sv_b['y1']
+            if sw > 0 and sh > 0:
+                sx = sw / vw
+                sy = sh / vh
+                node.set('bounds', _fmt_b(
+                    int(sv_b['x1'] + b['x1'] * sx),
+                    int(sv_b['y1'] + b['y1'] * sy),
+                    int(sv_b['x1'] + b['x2'] * sx),
+                    int(sv_b['y1'] + b['y2'] * sy),
+                ))
+        for child in node:
+            if child.tag == 'node':
+                _transform_recursive(child, sv_b, vw, vh)
+
+    try:
+        primary_root = ET.fromstring(_strip_decl(primary_xml))
+        virtual_root = ET.fromstring(_strip_decl(virtual_xml))
+        virtual_nodes = list(virtual_root)
+
+        if not virtual_nodes:
+            print(f"[MergeVirtual] ⚠️ display {virtual_display} 无子节点，跳过注入")
+            return primary_xml
+
+        print(f"[MergeVirtual] display {virtual_display} 共 {len(virtual_nodes)} 个顶层节点")
+
+        # ── 推算虚拟 display 分辨率（用于坐标缩放） ─────────────────────────────
+        if not virtual_w or not virtual_h:
+            # 优先从 display_info_cache 获取（已由 /api/displays 填充）
+            for di in display_info_cache:
+                if di.get('id') == str(virtual_display):
+                    _rm = re.search(r'(\d+)x(\d+)', di.get('description', ''))
+                    if _rm:
+                        virtual_w = int(_rm.group(1))
+                        virtual_h = int(_rm.group(2))
+                        print(f"[MergeVirtual] 从缓存得到 display {virtual_display} 分辨率: {virtual_w}x{virtual_h}")
+                    break
+
+        if not virtual_w or not virtual_h:
+            # 回退：从虚拟 display 顶层节点 bounds 的右下角推算
+            max_r, max_b = 0, 0
+            for vn in virtual_nodes:
+                vb = _parse_b(vn.get('bounds', ''))
+                if vb:
+                    max_r = max(max_r, vb['x2'])
+                    max_b = max(max_b, vb['y2'])
+            if max_r > 0 and max_b > 0:
+                virtual_w, virtual_h = max_r, max_b
+                print(f"[MergeVirtual] 从节点 bounds 推算 display {virtual_display} 尺寸: {virtual_w}x{virtual_h}")
+
+        if virtual_w and virtual_h:
+            print(f"[MergeVirtual] 坐标缩放基准：虚拟 display {virtual_display} = {virtual_w}x{virtual_h}")
+        else:
+            print(f"[MergeVirtual] ⚠️ 无法获取 display {virtual_display} 分辨率，注入时不做坐标缩放（仅平移）")
+
+        # ── 在主 display 树中找 SurfaceView 并注入 ──────────────────────────────
+        injected = [0]
+
+        def _find_and_inject(parent):
+            for child in list(parent):
+                if child.tag != 'node':
+                    continue
+                cls = child.get('class', '')
+                if 'SurfaceView' in cls:
+                    sv_b = _parse_b(child.get('bounds', ''))
+                    print(f"[MergeVirtual] 找到 SurfaceView #{injected[0]+1}: "
+                          f"class={cls}, bounds={child.get('bounds')}")
+                    child.set('virtual-display-injected', str(virtual_display))
+                    for vnode in virtual_nodes:
+                        vnode_copy = ET.fromstring(ET.tostring(vnode))
+                        vnode_copy.set('from-virtual-display', str(virtual_display))
+                        if sv_b and virtual_w and virtual_h:
+                            _transform_recursive(vnode_copy, sv_b, virtual_w, virtual_h)
+                        child.append(vnode_copy)
+                    injected[0] += 1
+                    print(f"[MergeVirtual] ✅ 已注入 {len(virtual_nodes)} 个节点到 SurfaceView #{injected[0]}")
+                    # 继续搜索（若存在多个 SurfaceView 均注入）
+                else:
+                    _find_and_inject(child)
+
+        _find_and_inject(primary_root)
+
+        if injected[0] == 0:
+            print(f"[MergeVirtual] ⚠️ 未在 display0 树中找到 SurfaceView，无法注入 display {virtual_display} 节点")
+        else:
+            print(f"[MergeVirtual] ✅ 完成：display {virtual_display} 节点已融合到 {injected[0]} 个 SurfaceView 下")
+
+        xml_str = ET.tostring(primary_root, encoding='unicode')
+        return '<?xml version="1.0" encoding="UTF-8"?>' + xml_str
+
+    except Exception as e:
+        print(f"[MergeVirtual] ❌ 注入失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return primary_xml
+
+
+def get_virtual_display_xml(serial: str, virtual_display: int, accessibility_serial: str) -> Optional[str]:
+    """获取虚拟 display 的节点 XML，依次尝试 AccessibilityService → UIAutomator。
+
+    参数：
+      serial               当前设备序列号（用于 UIAutomator adb 命令）
+      virtual_display      虚拟 display id（如 10）
+      accessibility_serial 辅助服务所在设备的序列号（用于 HTTP 探测）
+
+    返回：
+      XML 字符串，或 None（两种方式均失败）
+    """
+    # 1) 优先通过辅助服务（更可靠，API 33+ 可精确访问虚拟 display 窗口）
+    if check_accessibility_service(accessibility_serial):
+        xml = get_hierarchy_from_accessibility(accessibility_serial, virtual_display)
+        if xml and '<node' in xml:
+            print(f"[VirtualDisplay] ✅ 辅助服务成功获取 display {virtual_display} 节点")
+            return xml
+        print(f"[VirtualDisplay] ⚠️ 辅助服务未返回 display {virtual_display} 节点，尝试 UIAutomator")
+
+    # 2) 回退：UIAutomator dump --display N（Android 11+ 支持虚拟 display）
+    try:
+        import time
+        d = adb.device(serial=serial)
+        dump_path = f"/sdcard/uidump_virtual_{virtual_display}.xml"
+        d.shell(f"rm -f {dump_path}")
+        for attempt in range(2):
+            err = d.shell(f"uiautomator dump --compressed --display {virtual_display} {dump_path}")
+            print(f"[VirtualDisplay] UIAutomator dump display {virtual_display} (attempt {attempt+1}): {err}")
+            xml_content = d.shell(f"cat {dump_path}")
+            if xml_content and "<?xml" in xml_content:
+                start = xml_content.find("<?xml")
+                end = xml_content.rfind(">")
+                if start != -1 and end != -1:
+                    xml_trimmed = xml_content[start:end+1]
+                    if '<node' in xml_trimmed:
+                        print(f"[VirtualDisplay] ✅ UIAutomator 成功获取 display {virtual_display}")
+                        return xml_trimmed
+            time.sleep(0.3)
+        print(f"[VirtualDisplay] ⚠️ UIAutomator 也未能获取 display {virtual_display} 节点")
+    except Exception as e:
+        print(f"[VirtualDisplay] ❌ UIAutomator 异常: {e}")
+
+    return None
+
+
 def pick_accessibility_probe_serial(serial: str) -> str:
     """Pick the best serial for accessibility HTTP probe.
 
@@ -1412,7 +1863,16 @@ def pick_accessibility_probe_serial(serial: str) -> str:
         return serial
 
 @app.get("/api/hierarchy")
-def get_hierarchy(display: int = 0, force_accessibility: bool = False):
+def get_hierarchy(display: int = 0, force_accessibility: bool = False, merge_virtual_display: int = -1):
+    """获取 UI 层级树。
+
+    参数：
+      display                目标 display id（0=主屏，其他值=副屏/虚拟屏）
+      force_accessibility    True=优先使用辅助服务，False=优先使用 UIAutomator
+      merge_virtual_display  ≥0 时，将指定虚拟 display（如 10）的节点融合到主树的
+                             SurfaceView 节点下，并完成坐标映射。
+                             典型用法：?display=0&force_accessibility=true&merge_virtual_display=10
+    """
     global current_serial
     global hierarchy_xml_cache
     if not current_serial:
@@ -1420,6 +1880,8 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
     
     print(f"[Hierarchy] 📋 开始获取Display {display}的UI树...")
     print(f"[Hierarchy] 用户选择数据源: {'辅助服务' if force_accessibility else 'UIAutomator'}")
+    if merge_virtual_display >= 0:
+        print(f"[Hierarchy] 🔀 启用虚拟 display 融合模式：display {merge_virtual_display} → SurfaceView")
     
     # 根据用户选择使用对应的数据源
     if force_accessibility:
@@ -1434,8 +1896,21 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
             xml_from_accessibility = get_hierarchy_from_accessibility(target_serial, display)
             # 必须包含实际节点才算有效，空 hierarchy 不能直接返回（要 fallback 到 UIAutomator）
             if xml_from_accessibility and '<node' in xml_from_accessibility:
+                # ── 虚拟 display 节点融合（辅助服务路径） ────────────────────────
+                if merge_virtual_display >= 0:
+                    print(f"[Hierarchy] 🔀 [辅助服务] 开始融合 display {merge_virtual_display} 节点...")
+                    virtual_xml = get_virtual_display_xml(current_serial, merge_virtual_display, target_serial)
+                    if virtual_xml and '<node' in virtual_xml:
+                        xml_from_accessibility = inject_virtual_nodes_into_surfaceview(
+                            xml_from_accessibility, virtual_xml, merge_virtual_display
+                        )
+                        print(f"[Hierarchy] ✅ display {merge_virtual_display} 节点已融合到辅助服务树")
+                    else:
+                        print(f"[Hierarchy] ⚠️ display {merge_virtual_display} 无可用节点，跳过融合")
+                # ─────────────────────────────────────────────────────────────
                 print(f"[Hierarchy] ✅ 使用辅助服务数据源")
-                return {"xml": xml_from_accessibility, "source": "accessibility"}
+                return {"xml": xml_from_accessibility, "source": "accessibility",
+                        "merged_virtual_display": merge_virtual_display if merge_virtual_display >= 0 else None}
             elif xml_from_accessibility:
                 print(f"[Hierarchy] ⚠️ 辅助服务返回空节点树（display={display}），fallback到UIAutomator")
             else:
@@ -1894,10 +2369,14 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False):
                                     print(f"[Hierarchy] ⚠️ 坐标系超出期望: 节点范围 {span_w}x{span_h}"
                                           f" > 期望 {target_w}x{target_h}"
                                           f" (ratio={w_ratio:.2f}x{h_ratio:.2f})")
-                                elif (w_ratio < 0.9 and h_ratio < 0.9
+                                elif ((w_ratio < 0.9 or h_ratio < 0.9)
+                                      and w_ratio <= 1.1 and h_ratio <= 1.1
                                       and src_y_min <= 10 and src_x_min <= 100):
                                     # 坐标系比目标小 → 放大（UIAutomator 使用了不同的逻辑分辨率）
                                     # 额外条件：根节点贴近原点，说明这是"全屏"坐标系而非局部小窗口
+                                    # 使用 or 而非 and：任一轴偏小即触发
+                                    # 例如 SS4 Display4：span_w=3840=target_w(w_ratio=1.0), span_h=1740<2160(h_ratio=0.806)
+                                    # → 仅 h_ratio<0.9 满足，w_ratio<=1.1 满足，触发放大
                                     scale_remap = True
                                     print(f"[Hierarchy] ⚠️ 坐标空间偏小: 节点范围 {span_w}x{span_h}"
                                           f" < 期望 {target_w}x{target_h}"
