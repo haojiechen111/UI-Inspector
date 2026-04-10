@@ -2199,3 +2199,23 @@ input:checked+.slider::before {
     padding: 0 2px;
     font-style: normal;
 }
+
+/* ── 属性面板布尔值 badge ────────────────────────────────────────────────── */
+.prop-bool {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+.prop-bool-true {
+    background: rgba(52, 211, 153, 0.15);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.35);
+}
+.prop-bool-false {
+    background: rgba(248, 113, 113, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(248, 113, 113, 0.35);
+}

@@ -1840,6 +1840,46 @@ def get_virtual_display_xml(serial: str, virtual_display: int, accessibility_ser
     return None
 
 
+def _postprocess_add_visible_to_user(xml_str: str) -> str:
+    """为 UIAutomator XML 中缺失 visible-to-user 的节点补上该属性（按 bounds 推断）。
+
+    UIAutomator dump 本身不含 visible-to-user 字段，而辅助服务模式可以提供该字段。
+    为保持两种模式属性展示一致，对 UIAutomator XML 做后处理：
+      - bounds 有面积（x2>x1 且 y2>y1）→ visible-to-user=true
+      - bounds 为零 / 不存在            → visible-to-user=false
+    """
+    try:
+        import xml.etree.ElementTree as ET
+
+        def _strip(s):
+            s = s.strip()
+            if s.startswith('<?xml'):
+                return s[s.find('?>') + 2:].lstrip()
+            return s
+
+        root = ET.fromstring(_strip(xml_str))
+
+        def _add_attr(node):
+            if node.tag == 'node' and 'visible-to-user' not in node.attrib:
+                b_str = node.get('bounds', '')
+                visible = 'false'
+                if b_str:
+                    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', b_str)
+                    if m:
+                        x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                        if x2 > x1 and y2 > y1:
+                            visible = 'true'
+                node.set('visible-to-user', visible)
+            for child in node:
+                _add_attr(child)
+
+        _add_attr(root)
+        return '<?xml version="1.0" encoding="UTF-8"?>' + ET.tostring(root, encoding='unicode')
+    except Exception as e:
+        print(f"[PostProcess] add_visible_to_user failed: {e}")
+        return xml_str
+
+
 def pick_accessibility_probe_serial(serial: str) -> str:
     """Pick the best serial for accessibility HTTP probe.
 
@@ -2432,6 +2472,8 @@ def get_hierarchy(display: int = 0, force_accessibility: bool = False, merge_vir
         # 成功获取到XML
         uiautomator_xml = xml_content
         print(f"[Hierarchy] ✅ UIAutomator数据获取成功")
+        # 补充 visible-to-user 属性（UIAutomator dump 不提供此字段，按 bounds 有无面积推断）
+        uiautomator_xml = _postprocess_add_visible_to_user(uiautomator_xml)
         # cache
         hierarchy_xml_cache[display] = uiautomator_xml
         return {"xml": uiautomator_xml, "source": "uiautomator"}
@@ -2791,6 +2833,51 @@ def disable_accessibility_service():
     except Exception as e:
         print(f"[Accessibility] ❌ 禁用失败: {e}")
         raise HTTPException(status_code=500, detail=f"禁用辅助服务失败: {str(e)}")
+
+
+@app.post("/api/accessibility/restart-service")
+def api_restart_accessibility_service():
+    """通过切换 accessibility_enabled 开关（0→1）强制重新激活辅助服务，等待端口 8765 响应。"""
+    global current_serial
+    if not current_serial:
+        raise HTTPException(status_code=400, detail="Device not connected")
+    target_serial = pick_accessibility_shell_serial(current_serial)
+    steps: List[str] = []
+    try:
+        import time
+        _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=5)
+        steps.append("📡 端口转发: tcp:8765 → tcp:8765")
+        r0 = _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure",
+                        "accessibility_enabled", "0"], timeout=5)
+        steps.append(f"🔘 关闭 accessibility_enabled: rc={r0.returncode}")
+        time.sleep(1)
+        r1 = _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure",
+                        "accessibility_enabled", "1"], timeout=5)
+        steps.append(f"✅ 开启 accessibility_enabled: rc={r1.returncode}")
+        try:
+            rc_cmd = _adb_run(
+                ["adb", "-s", target_serial, "shell", "cmd", "accessibility", "enable",
+                 "com.carui.accessibility/.CarUIAccessibilityService"],
+                timeout=8
+            )
+            steps.append(f"♿ cmd accessibility enable: rc={rc_cmd.returncode}")
+        except Exception as _e:
+            steps.append(f"♿ cmd accessibility enable: 跳过 ({_e})")
+        running = False
+        for i in range(30):
+            if check_accessibility_service(target_serial):
+                running = True
+                steps.append(f"🎉 服务在约 {(i + 1) * 0.5:.1f}s 后响应")
+                break
+            time.sleep(0.5)
+        if not running:
+            steps.append("⏰ 等待超时（15s），服务仍未响应")
+        return {"success": running, "running": running, "steps": steps, "target_serial": target_serial}
+    except Exception as e:
+        steps.append(f"❌ 异常: {e}")
+        return {"success": False, "running": False, "steps": steps, "error": str(e),
+                "target_serial": target_serial}
+
 
 @app.get("/api/accessibility/status")
 def get_accessibility_status():

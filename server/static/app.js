@@ -1270,19 +1270,58 @@ async function updateAccessibilityUIStatus() {
 
     if (!data.enabled || !data.running) {
         addLogEntry(`⚠️ 辅助服务异常：${enabledText} / ${runningText}`, 'warning');
-        addLogEntry('💡 建议：到系统"无障碍"里打开 CarUI Accessibility；或重启服务后重连', 'info');
-        // 辅助服务未运行 → 弹出 APK 安装/引导弹窗（附带实际状态说明）
-        const modalMsg = data.enabled
-            ? `APK 已安装且辅助服务<b>已在 Settings 中启用</b>，但 HTTP 端口 8765 未响应。<br>可能原因：服务崩溃、端口占用、或需要手动在设置中重新切换开关。<br>如仍无法自动启动，请尝试重新安装 APK：`
-            : `辅助服务<b>未在 Settings 中启用</b>（Settings 写入可能失败，需 root 权限）。<br>请重新安装 APK 后手动到「设置 &gt; 无障碍」中开启 CarUI Accessibility：`;
-        showApkInstallModal(modalMsg);
+        if (data.enabled && !data.running) {
+            // 已启用但端口未响应 → 轻量通知 + 一键修复按钮，避免每次都弹 APK 安装弹窗
+            addLogEntry('💡 端口 8765 未响应：可点「一键修复」尝试切换开关重新激活', 'info');
+            showNotice(
+                `⚠️ 辅助服务已启用但端口 8765 未响应 &nbsp;` +
+                `<button onclick="tryRestartA11yService()" style="padding:1px 8px;font-size:11px;cursor:pointer;background:#3b82f6;color:white;border:none;border-radius:3px;">🔄 一键修复</button>` +
+                ` &nbsp;<button onclick="showApkInstallModal('如一键修复无效，请尝试重新安装 APK：')" style="padding:1px 8px;font-size:11px;cursor:pointer;background:#6b7280;color:white;border:none;border-radius:3px;">📦 重装APK</button>`,
+                'warning', 0
+            );
+        } else {
+            addLogEntry('💡 建议：到系统"无障碍"里打开 CarUI Accessibility；或重启服务后重连', 'info');
+            const modalMsg = `辅助服务<b>未在 Settings 中启用</b>（Settings 写入可能失败，需 root 权限）。<br>请重新安装 APK 后手动到「设置 &gt; 无障碍」中开启 CarUI Accessibility：`;
+            showApkInstallModal(modalMsg);
+        }
     } else {
         addLogEntry('✅ 辅助服务运行正常', 'success');
     }
 }
 
+async function tryRestartA11yService() {
+    showNotice('🔄 正在尝试重新激活辅助服务，请稍候（最多 15s）...', 'info', 0);
+    addLogEntry('🔄 执行一键修复：切换无障碍开关，等待服务响应...', 'info');
+    showToast();
+    try {
+        const resp = await fetchWithTimeout('/api/accessibility/restart-service', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        }, 20000);
+        const data = await resp.json();
+        if (data.steps) { data.steps.forEach(s => addLogEntry(s, 'info')); }
+        if (data.running) {
+            showNotice('✅ 辅助服务重新激活成功！', 'success', 4000);
+            addLogEntry('✅ 辅助服务端口已响应，激活成功！', 'success');
+            await updateAccessibilityUIStatus();
+            if (currentDevice) { refreshHierarchy(); }
+        } else {
+            showNotice(
+                `❌ 重新激活失败（服务仍未响应）&nbsp;` +
+                `<button onclick="showApkInstallModal('一键修复无效，请尝试重新安装 APK：')" ` +
+                `style="padding:1px 8px;font-size:11px;cursor:pointer;background:#6b7280;color:white;border:none;border-radius:3px;">📦 重装APK</button>`,
+                'error', 0
+            );
+            addLogEntry('❌ 一键修复失败，建议尝试重新安装 APK 或手动在无障碍设置中切换开关', 'error');
+        }
+    } catch (e) {
+        showNotice(`❌ 激活请求失败: ${e.message || e}`, 'error', 6000);
+        addLogEntry(`❌ 一键修复请求异常: ${e.message || e}`, 'error');
+    }
+}
+
 async function refreshSnapshot(forceShowLoading = true) {
-    // 如果之前被“关闭截屏页面/重启清理”隐藏了，这里恢复显示
+    // 如果之前被"关闭截屏页面/重启清理"隐藏了，这里恢复显示
     const screenEmpty = document.getElementById('screenEmptyState');
     if (screenEmpty) screenEmpty.classList.add('hidden');
 
@@ -1954,7 +1993,8 @@ function renderProperties(attrs) {
     // 优先展示的属性顺序
     const PRIORITY_KEYS = [
         'package', 'resource-id', 'content-desc', 'text',
-        'clickable', 'visible-to-user', 'enabled', 'scrollable'
+        'clickable', 'visible-to-user', 'enabled', 'scrollable',
+        'long-clickable', 'focusable', 'focused', 'selected', 'checkable', 'checked'
     ];
     const allKeys = Object.keys(attrs);
     const sortedKeys = [
@@ -1998,6 +2038,25 @@ function renderProperties(attrs) {
             }
         }
         
+        // 为布尔属性添加彩色 badge（仅在无搜索高亮时）
+        if (!matchedPattern && (value === 'true' || value === 'false')) {
+            const BOOLEAN_PROPS = new Set([
+                'clickable', 'long-clickable', 'enabled', 'focusable',
+                'focused', 'selected', 'checkable', 'checked', 'scrollable',
+                'visible-to-user'
+            ]);
+            if (BOOLEAN_PROPS.has(key)) {
+                const isTrue = value === 'true';
+                valueHtml = `<span class="prop-bool ${isTrue ? 'prop-bool-true' : 'prop-bool-false'}">${value}</span>`;
+                // visible-to-user 行加额外背景高亮
+                if (key === 'visible-to-user') {
+                    rowStyle = isTrue
+                        ? ` style="background-color: rgba(52,211,153,0.08);"`
+                        : ` style="background-color: rgba(248,113,113,0.08);"`;
+                }
+            }
+        }
+
         html += `<tr${rowStyle}><th>${keyHtml}</th><td>${valueHtml}</td></tr>`;
     }
     
