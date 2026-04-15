@@ -77,10 +77,35 @@ hierarchy_xml_cache: Dict[int, str] = {}
 ss4_localhost_mapping: Dict[str, Dict[str, str]] = {}
 
 
+def _find_working_adb() -> str:
+    """Find an adb binary that correctly handles `adb -s <serial> forward`.
+
+    adb 37.x has a regression where `adb -s <serial> forward` fails with
+    'more than one device/emulator' even when -s is specified, in multi-device
+    scenarios. Prefer the system adb (/usr/bin/adb, v28) which does not have
+    this bug. The Android Studio SDK adb (v37) is avoided.
+    """
+    import shutil
+    # Prefer system-installed adb (known stable with -s serial + forward)
+    for p in ["/usr/bin/adb", "/usr/lib/android-sdk/platform-tools/adb"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            print(f"[adb] Using system adb: {p}  (avoids SDK adb 37.x -s forward regression)")
+            return p
+    # Fallback: resolve from PATH
+    resolved = shutil.which("adb")
+    if resolved:
+        print(f"[adb] Using PATH adb: {resolved}")
+        return resolved
+    return "adb"
+
+
+_ADB_BIN: str = _find_working_adb()
+
+
 def _adb_shell_run(serial: str, cmd: str, timeout: int = 6) -> subprocess.CompletedProcess:
     """Run adb shell and return CompletedProcess (stdout/stderr/returncode)."""
     return subprocess.run(
-        ["adb", "-s", serial, "shell", cmd],
+        [_ADB_BIN, "-s", serial, "shell", cmd],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -129,7 +154,7 @@ def _list_adb_device_serials() -> List[str]:
     """Best-effort parse `adb devices` and return online serials."""
     try:
         r = subprocess.run(
-            ["adb", "devices"],
+            [_ADB_BIN, "devices"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -154,7 +179,7 @@ def infer_original_serial_from_localhost_forward() -> Optional[str]:
     """
     try:
         r = subprocess.run(
-            ["adb", "forward", "--list"],
+            [_ADB_BIN, "forward", "--list"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -185,7 +210,13 @@ def get_accessibility_candidate_serials(serial: str) -> List[str]:
     - localhost:5559（通常可执行完整 Android shell 命令）
     - original_serial（某些环境下才是真正安装/运行 APK 的 serial）
 
-    为了避免“选错 serial 导致一直显示未运行”，这里返回两者并由上层逐个探测。
+    为了避免"选错 serial 导致一直显示未运行"，这里返回两者并由上层逐个探测。
+
+    ⚠️ 修复：对于 localhost:5559，必须把自身排在候选列表**首位**。
+    原因：localhost:5559 才是真正运行辅助服务（HTTP 8765）的 Android 环境，
+    物理 serial（如 da157e15a1f）只是 SS4 底层硬件 serial，不运行 AndroidSystem。
+    若物理 serial 排在前面，其 adb forward tcp:8765 会先占用宿主机端口，
+    导致后续 localhost:5559 的 HTTP 探测有时无法响应（端口竞争/顺序问题）。
     """
     global ss4_localhost_mapping
 
@@ -194,13 +225,17 @@ def get_accessibility_candidate_serials(serial: str) -> List[str]:
 
     cands: List[str] = []
 
-    # 1) 首选：进程内已有映射
+    # 0) ★ 关键修复：localhost:5559 自身排在最前面
+    #    它是辅助服务真正运行的 Android 实例，应优先探测
+    cands.append(serial)
+
+    # 1) 进程内已有映射（物理 serial，保留作 APK 安装兜底）
     if serial in ss4_localhost_mapping:
         orig = (ss4_localhost_mapping.get(serial) or {}).get("original_serial")
         if orig:
             cands.append(orig)
 
-    # 2) 兜底：forward --list 推断
+    # 2) 兜底：forward --list 推断物理 serial
     inferred = infer_original_serial_from_localhost_forward()
     if inferred:
         cands.append(inferred)
@@ -209,9 +244,6 @@ def get_accessibility_candidate_serials(serial: str) -> List[str]:
     non_local = [s for s in _list_adb_device_serials() if s != "localhost:5559"]
     if len(non_local) == 1:
         cands.append(non_local[0])
-
-    # 4) 最后保留 localhost 自身
-    cands.append(serial)
 
     # de-duplicate while preserving order
     seen = set()
@@ -251,7 +283,7 @@ def _adb_shell(serial: str, cmd: str, timeout: int = 5) -> str:
     """Run adb shell command and return stdout (best-effort)."""
     try:
         res = subprocess.run(
-            ["adb", "-s", serial, "shell", cmd],
+            [_ADB_BIN, "-s", serial, "shell", cmd],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -396,7 +428,7 @@ def refresh_display_mapping(serial: str):
     try:
         # 优先使用简单 dumpsys display 解析
         dump_r = subprocess.run(
-            ["adb", "-s", serial, "shell", "dumpsys", "display"],
+            [_ADB_BIN, "-s", serial, "shell", "dumpsys", "display"],
             capture_output=True, text=True, timeout=8, check=False,
         )
         dump_out = dump_r.stdout or ""
@@ -408,7 +440,7 @@ def refresh_display_mapping(serial: str):
         # 补充物理ID映射（最佳努力，不阻塞返回）
         try:
             sf_output = subprocess.run(
-                ["adb", "-s", serial, "shell", "dumpsys SurfaceFlinger --display-id"],
+                [_ADB_BIN, "-s", serial, "shell", "dumpsys SurfaceFlinger --display-id"],
                 capture_output=True, text=True, timeout=5, check=False,
             ).stdout or ""
             phys_to_name = dict(re.findall(
@@ -460,7 +492,7 @@ def detect_ss_device(serial: str) -> Optional[str]:
     try:
         # Use getprop directly to get ro.build.display.id
         result = subprocess.run(
-            ["adb", "-s", serial, "shell", "getprop", "ro.build.display.id"],
+            [_ADB_BIN, "-s", serial, "shell", "getprop", "ro.build.display.id"],
             capture_output=True, text=True, timeout=5
         )
         
@@ -573,7 +605,7 @@ def init_ss4_device(req: SS4InitRequest):
         print(f"Initializing SS4 device: {serial}")
         
         # Step 1: adb root
-        result = subprocess.run(["adb", "-s", serial, "root"], 
+        result = subprocess.run([_ADB_BIN, "-s", serial, "root"], 
                               capture_output=True, text=True, timeout=10)
         print(f"adb root: {result.stdout}")
         if result.returncode != 0:
@@ -584,7 +616,7 @@ def init_ss4_device(req: SS4InitRequest):
         time.sleep(1)
         
         # Step 2: adb shell adbconnect.sh
-        result = subprocess.run(["adb", "-s", serial, "shell", "adbconnect.sh"], 
+        result = subprocess.run([_ADB_BIN, "-s", serial, "shell", "adbconnect.sh"], 
                               capture_output=True, text=True, timeout=10)
         print(f"adbconnect.sh: {result.stdout}")
         if result.returncode != 0:
@@ -593,7 +625,7 @@ def init_ss4_device(req: SS4InitRequest):
         time.sleep(1)
         
         # Step 3: adb forward tcp:5559 tcp:5557
-        result = subprocess.run(["adb", "-s", serial, "forward", "tcp:5559", "tcp:5557"], 
+        result = subprocess.run([_ADB_BIN, "-s", serial, "forward", "tcp:5559", "tcp:5557"], 
                               capture_output=True, text=True, timeout=10)
         print(f"adb forward: {result.stdout}")
         if result.returncode != 0:
@@ -602,7 +634,7 @@ def init_ss4_device(req: SS4InitRequest):
         time.sleep(1)
         
         # Step 4: adb connect localhost:5559
-        result = subprocess.run(["adb", "connect", "localhost:5559"], 
+        result = subprocess.run([_ADB_BIN, "connect", "localhost:5559"], 
                               capture_output=True, text=True, timeout=10)
         print(f"adb connect: {result.stdout}")
         if result.returncode != 0:
@@ -611,7 +643,7 @@ def init_ss4_device(req: SS4InitRequest):
         time.sleep(2)
         
         # Step 5: adb -s localhost:5559 root
-        result = subprocess.run(["adb", "-s", "localhost:5559", "root"], 
+        result = subprocess.run([_ADB_BIN, "-s", "localhost:5559", "root"], 
                               capture_output=True, text=True, timeout=10)
         print(f"adb root (localhost): {result.stdout}")
         if result.returncode != 0:
@@ -677,7 +709,7 @@ def get_displays(serial: Optional[str] = None):
     for display_id in range(6):
         try:
             r = subprocess.run(
-                ["adb", "-s", target_serial, "shell", f"wm size -d {display_id}"],
+                [_ADB_BIN, "-s", target_serial, "shell", f"wm size -d {display_id}"],
                 capture_output=True, text=True, timeout=3, check=False,
             )
             out = (r.stdout or "").strip()
@@ -699,7 +731,7 @@ def get_displays(serial: Optional[str] = None):
     for display_id in range(6):
         try:
             result = subprocess.run(
-                ["adb", "-s", target_serial, "shell", f"screencap -d {display_id} -p"],
+                [_ADB_BIN, "-s", target_serial, "shell", f"screencap -d {display_id} -p"],
                 capture_output=True, timeout=5, check=False,
             )
             if result.returncode == 0 and len(result.stdout) > 100 and b"\x89PNG" in result.stdout:
@@ -740,7 +772,7 @@ def connect_device(req: ConnectRequest):
         try:
             import time as _t_root
             _root_r = subprocess.run(
-                ["adb", "-s", current_serial, "root"],
+                [_ADB_BIN, "-s", current_serial, "root"],
                 capture_output=True, text=True, timeout=10
             )
             _root_out = (_root_r.stdout or "").strip()
@@ -950,31 +982,31 @@ def get_screenshot(display: str = "0"):
             # ── exec-out 变体（最高优先级，直接二进制流，不走 shell）──────────────────
             # 对非 0 display 尤其重要：shell 协议可能截断二进制数据
             if display != "0":
-                subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", display, "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "exec-out", "screencap", "-d", display, "-p"])
                 if phys_id != display:
-                    subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", phys_id, "-p"])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "exec-out", "screencap", "-d", phys_id, "-p"])
                     # local: 前缀变体：SS4 screencap 对长物理 ID 可能需要 local: 前缀
                     if len(str(phys_id)) > 6:
-                        subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-d", f"local:{phys_id}", "-p"])
+                        subprocess_variations.append([_ADB_BIN, "-s", current_serial, "exec-out", "screencap", "-d", f"local:{phys_id}", "-p"])
             else:
-                subprocess_variations.append(["adb", "-s", current_serial, "exec-out", "screencap", "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "exec-out", "screencap", "-p"])
             
             # ── 传统 shell 变体（兜底）──────────────────────────────────────────────
             if ss_type == "SS2":
                 if display == "0":
-                    subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p"])
-                subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-d", display, "-p"])
-                subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p", "-d", display])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-d", display, "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-p", "-d", display])
                 if phys_id != display:
-                    subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-d", phys_id, "-p"])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-d", phys_id, "-p"])
             else:
                 if display == "0":
-                    subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p"])
-                subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-d", display, "-p"])
-                subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p", "-d", display])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-d", display, "-p"])
+                subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-p", "-d", display])
                 if phys_id != display:
-                    subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-d", phys_id, "-p"])
-                    subprocess_variations.append(["adb", "-s", current_serial, "shell", "screencap", "-p", "-d", phys_id])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-d", phys_id, "-p"])
+                    subprocess_variations.append([_ADB_BIN, "-s", current_serial, "shell", "screencap", "-p", "-d", phys_id])
             
             for cmd in subprocess_variations:
                 print(f"[SCREENSHOT] 🔧 subprocess尝试: {' '.join(cmd)}")
@@ -1014,19 +1046,19 @@ def get_screenshot(display: str = "0"):
                 import time as _t
                 _wm_tmp = "/sdcard/.ui_insp_sc_tmp.png"
                 _wm_r = subprocess.run(
-                    ["adb", "-s", current_serial, "shell", f"wm screenshot {_wm_tmp}"],
+                    [_ADB_BIN, "-s", current_serial, "shell", f"wm screenshot {_wm_tmp}"],
                     capture_output=True, check=False, timeout=8
                 )
                 _wm_stdout = (_wm_r.stdout or b"").decode("utf-8", errors="replace").strip()
                 # 成功标志：returncode 0，或输出为空（wm screenshot 成功时通常无输出）
                 if _wm_r.returncode == 0 or (not _wm_stdout) or "Written" in _wm_stdout:
                     _pull_r = subprocess.run(
-                        ["adb", "-s", current_serial, "exec-out", f"cat {_wm_tmp}"],
+                        [_ADB_BIN, "-s", current_serial, "exec-out", f"cat {_wm_tmp}"],
                         capture_output=True, check=False, timeout=10
                     )
                     # 后台删除临时文件（不等待）
                     subprocess.Popen(
-                        ["adb", "-s", current_serial, "shell", f"rm -f {_wm_tmp}"],
+                        [_ADB_BIN, "-s", current_serial, "shell", f"rm -f {_wm_tmp}"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
                     if _pull_r.stdout and _is_png_complete(_pull_r.stdout):
@@ -1067,7 +1099,7 @@ def check_accessibility_service(serial: str) -> bool:
     try:
         # 设置端口转发
         fw = subprocess.run(
-            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            [_ADB_BIN, "-s", serial, "forward", "tcp:8765", "tcp:8765"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -1119,7 +1151,7 @@ def probe_accessibility_service(serial: str) -> Dict:
 
     try:
         fw = subprocess.run(
-            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            [_ADB_BIN, "-s", serial, "forward", "tcp:8765", "tcp:8765"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -1254,7 +1286,7 @@ def ensure_accessibility_service(
         installed = False
         last_pm_err = ""
         for s in candidates:
-            r = _adb_run(["adb", "-s", s, "shell", "pm", "path", pkg], timeout=8)
+            r = _adb_run([_ADB_BIN, "-s", s, "shell", "pm", "path", pkg], timeout=8)
             if r.returncode == 0 and ("package:" in (r.stdout or "")):
                 installed = True
                 install_serial = s
@@ -1276,7 +1308,7 @@ def ensure_accessibility_service(
                 install_ok = False
                 last_install_err = ""
                 for s in install_try_serials:
-                    ir = _adb_run(["adb", "-s", s, "install", "--no-streaming", "-r", "-t", "-d", apk_path], timeout=90)
+                    ir = _adb_run([_ADB_BIN, "-s", s, "install", "--no-streaming", "-r", "-t", "-d", apk_path], timeout=90)
                     if ir.returncode == 0:
                         install_ok = True
                         install_serial = s
@@ -1299,7 +1331,7 @@ def ensure_accessibility_service(
         step("Trying adb root (required for car ECUs to write secure settings)")
         try:
             import time as _time_root
-            root_r = _adb_run(["adb", "-s", target_serial, "root"], timeout=8)
+            root_r = _adb_run([_ADB_BIN, "-s", target_serial, "root"], timeout=8)
             root_out = (root_r.stdout or "").strip()
             step(f"adb root: rc={root_r.returncode} -> {root_out[:120]}")
             if root_r.returncode == 0 and "already" not in root_out.lower():
@@ -1311,7 +1343,7 @@ def ensure_accessibility_service(
                 _reconnected = False
                 for _wait_i in range(28):
                     try:
-                        _dev_r = _adb_run(["adb", "-s", target_serial, "get-state"], timeout=3)
+                        _dev_r = _adb_run([_ADB_BIN, "-s", target_serial, "get-state"], timeout=3)
                         if _dev_r.returncode == 0 and "device" in (_dev_r.stdout or "").lower():
                             step(f"adbd reconnected after ~{_wait_i + 2}s")
                             _reconnected = True
@@ -1328,7 +1360,7 @@ def ensure_accessibility_service(
 
         # 3) Enable secure settings (optional)
         if enable_service:
-            r = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
+            r = _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6)
             current_services = (r.stdout or "").strip()
             component = "com.carui.accessibility/.CarUIAccessibilityService"
             if "com.carui.accessibility" in current_services:
@@ -1338,11 +1370,11 @@ def ensure_accessibility_service(
                     f"{current_services}:{component}" if current_services and current_services != "null" else component
                 )
                 step(f"Enabling service via secure settings: {component}")
-                _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services], timeout=6)
+                _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services], timeout=6)
 
-            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+            _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
 
-            enabled_services_now = _adb_run(["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6).stdout.strip()
+            enabled_services_now = _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"], timeout=6).stdout.strip()
             result["enabled"] = "com.carui.accessibility" in (enabled_services_now or "")
             step(f"Enabled now? {result['enabled']}")
             if not result["enabled"]:
@@ -1353,14 +1385,14 @@ def ensure_accessibility_service(
             # 需要切换 accessibility_enabled 来强制 AccessibilityManagerService 重新扫描。
             step("Force-rebind: toggling accessibility_enabled 0→1 to nudge framework")
             import time as _time_bind
-            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "0"], timeout=6)
+            _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "0"], timeout=6)
             _time_bind.sleep(1)
-            _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
+            _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", "accessibility_enabled", "1"], timeout=6)
 
             # 3.2) cmd accessibility enable（Android 10+ / 部分车机支持，最强触发方式）
             try:
                 _cmd_r = _adb_run(
-                    ["adb", "-s", target_serial, "shell", "cmd", "accessibility", "enable",
+                    [_ADB_BIN, "-s", target_serial, "shell", "cmd", "accessibility", "enable",
                      "com.carui.accessibility/.CarUIAccessibilityService"],
                     timeout=8,
                 )
@@ -1374,7 +1406,7 @@ def ensure_accessibility_service(
 
         # 4) Probe running (optional)
         if probe_running:
-            _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
+            _adb_run([_ADB_BIN, "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
 
             import time
             running = False
@@ -1389,16 +1421,16 @@ def ensure_accessibility_service(
                 step("WARNING: service not responding on 8765; please open Accessibility settings and toggle service")
                 # 诊断：进程是否存在 + 端口是否监听
                 try:
-                    _ps_out = (_adb_run(["adb", "-s", target_serial, "shell", "ps", "-A"], timeout=6).stdout or "")
+                    _ps_out = (_adb_run([_ADB_BIN, "-s", target_serial, "shell", "ps", "-A"], timeout=6).stdout or "")
                     _has_proc = "carui" in _ps_out.lower()
                     step(f"DIAG: carui process in ps? {_has_proc}")
                     # 0x223D = 8765
-                    _net_out = (_adb_run(["adb", "-s", target_serial, "shell", "cat /proc/net/tcp6"], timeout=5).stdout or "")
+                    _net_out = (_adb_run([_ADB_BIN, "-s", target_serial, "shell", "cat /proc/net/tcp6"], timeout=5).stdout or "")
                     _port_up = "223D" in _net_out.upper()
                     step(f"DIAG: port 8765 listening? {_port_up}")
                     if _port_up and not running:
                         step("DIAG: port up but HTTP not responding → re-forwarding")
-                        _fw2 = _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
+                        _fw2 = _adb_run([_ADB_BIN, "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=6)
                         step(f"DIAG: re-forward rc={_fw2.returncode}")
                         # 额外再探一次
                         if check_accessibility_service(target_serial):
@@ -1422,7 +1454,7 @@ def _get_display_bounds_from_dumpsys(serial: str, display: int):
     try:
         import re
         result = subprocess.run(
-            ["adb", "-s", serial, "shell", "dumpsys", "display"],
+            [_ADB_BIN, "-s", serial, "shell", "dumpsys", "display"],
             capture_output=True, text=True, timeout=5
         )
         output = result.stdout
@@ -1473,7 +1505,7 @@ def get_hierarchy_from_accessibility(serial: str, display: int = 0) -> Optional[
         
         # 确保端口转发（某些设备/系统在状态检测后仍可能失效，兜底再 forward 一次）
         subprocess.run(
-            ["adb", "-s", serial, "forward", "tcp:8765", "tcp:8765"],
+            [_ADB_BIN, "-s", serial, "forward", "tcp:8765", "tcp:8765"],
             capture_output=True,
             timeout=3,
             check=False,
@@ -2627,7 +2659,7 @@ def enable_accessibility_service():
         
         # 获取当前启用的所有辅助服务
         result = subprocess.run(
-            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+            [_ADB_BIN, "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -2651,21 +2683,21 @@ def enable_accessibility_service():
         
         # 更新设置（使用target_serial）
         subprocess.run(
-            ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
+            [_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", 
              "enabled_accessibility_services", new_services],
             capture_output=True, text=True, timeout=3
         )
         
         # 确保辅助服务功能已启用
         subprocess.run(
-            ["adb", "-s", target_serial, "shell", "settings", "put", "secure",
+            [_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure",
              "accessibility_enabled", "1"],
             capture_output=True, text=True, timeout=3
         )
         
         # 设置端口转发（使用target_serial）
         subprocess.run(
-            ["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"],
+            [_ADB_BIN, "-s", target_serial, "forward", "tcp:8765", "tcp:8765"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -2745,9 +2777,9 @@ def api_install_apk(req: InstallApkRequest):
         raise HTTPException(status_code=404, detail="APK 文件不存在，请先编译辅助服务模块")
 
     if req.no_streaming:
-        cmd = ["adb", "-s", serial, "install", "--no-streaming", "-r", "-t", "-d", apk_path]
+        cmd = [_ADB_BIN, "-s", serial, "install", "--no-streaming", "-r", "-t", "-d", apk_path]
     else:
-        cmd = ["adb", "-s", serial, "install", "-r", "-t", apk_path]
+        cmd = [_ADB_BIN, "-s", serial, "install", "-r", "-t", apk_path]
 
     result = _adb_run(cmd, timeout=90)
     output = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -2756,7 +2788,7 @@ def api_install_apk(req: InstallApkRequest):
     # 签名不匹配时自动先卸载再安装（INSTALL_FAILED_UPDATE_INCOMPATIBLE）
     if not success and "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in output:
         print(f"[InstallAPK] ⚠️ 签名不匹配，自动卸载旧版本再重装...")
-        uninstall_r = _adb_run(["adb", "-s", serial, "uninstall", "com.carui.accessibility"], timeout=15)
+        uninstall_r = _adb_run([_ADB_BIN, "-s", serial, "uninstall", "com.carui.accessibility"], timeout=15)
         uninstall_out = ((uninstall_r.stdout or "") + (uninstall_r.stderr or "")).strip()
         print(f"[InstallAPK] 卸载结果: {uninstall_out}")
         # 重新安装
@@ -2792,7 +2824,7 @@ def disable_accessibility_service():
         
         # 获取当前启用的所有辅助服务
         result = subprocess.run(
-            ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+            [_ADB_BIN, "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
             capture_output=True, text=True, timeout=3
         )
         
@@ -2809,7 +2841,7 @@ def disable_accessibility_service():
             
             # 更新设置（使用target_serial）
             subprocess.run(
-                ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
+                [_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", 
                  "enabled_accessibility_services", new_services],
                 capture_output=True, text=True, timeout=3
             )
@@ -2845,18 +2877,18 @@ def api_restart_accessibility_service():
     steps: List[str] = []
     try:
         import time
-        _adb_run(["adb", "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=5)
+        _adb_run([_ADB_BIN, "-s", target_serial, "forward", "tcp:8765", "tcp:8765"], timeout=5)
         steps.append("📡 端口转发: tcp:8765 → tcp:8765")
-        r0 = _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure",
+        r0 = _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure",
                         "accessibility_enabled", "0"], timeout=5)
         steps.append(f"🔘 关闭 accessibility_enabled: rc={r0.returncode}")
         time.sleep(1)
-        r1 = _adb_run(["adb", "-s", target_serial, "shell", "settings", "put", "secure",
+        r1 = _adb_run([_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure",
                         "accessibility_enabled", "1"], timeout=5)
         steps.append(f"✅ 开启 accessibility_enabled: rc={r1.returncode}")
         try:
             rc_cmd = _adb_run(
-                ["adb", "-s", target_serial, "shell", "cmd", "accessibility", "enable",
+                [_ADB_BIN, "-s", target_serial, "shell", "cmd", "accessibility", "enable",
                  "com.carui.accessibility/.CarUIAccessibilityService"],
                 timeout=8
             )
@@ -2908,7 +2940,7 @@ def get_accessibility_status():
         try:
             result = subprocess.run(
                 [
-                    "adb",
+                    _ADB_BIN,
                     "-s",
                     shell_serial,
                     "shell",
@@ -2980,7 +3012,7 @@ def restart_server():
                     print(f"[RESTART] ♿ SS设备修正辅助服务目标序列号: {current_serial} -> {target_serial}")
 
                 result = subprocess.run(
-                    ["adb", "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
+                    [_ADB_BIN, "-s", target_serial, "shell", "settings", "get", "secure", "enabled_accessibility_services"],
                     capture_output=True, text=True, timeout=3
                 )
                 
@@ -2993,7 +3025,7 @@ def restart_server():
                     new_services = ':'.join(services_list)
                     
                     subprocess.run(
-                        ["adb", "-s", target_serial, "shell", "settings", "put", "secure", 
+                        [_ADB_BIN, "-s", target_serial, "shell", "settings", "put", "secure", 
                          "enabled_accessibility_services", new_services],
                         capture_output=True, text=True, timeout=3
                     )

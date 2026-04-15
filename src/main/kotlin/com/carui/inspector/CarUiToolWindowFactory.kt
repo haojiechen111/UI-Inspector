@@ -39,6 +39,18 @@ class CarUiToolWindowFactory : ToolWindowFactory {
             TextVisibleSpeakLauncher.launch(project, pluginPath)
         }
         toolbar.add(btnTextVisibleSpeak)
+
+        // 版本号转换工具按钮：点击打开 HU 版本号字符串 ↔ 数字 互转对话框
+        val btnVersionConverter = JButton("版本号转换")
+        btnVersionConverter.toolTipText =
+            "HU 版本号字符串 ↔ 数字 互转工具（对应 DevUtils.getFormatHuVersion）\n" +
+            "示例：12.4.0 → 12104000"
+        btnVersionConverter.addActionListener {
+            val owner = javax.swing.SwingUtilities.getWindowAncestor(toolbar)
+            VersionConverterDialog(owner).isVisible = true
+        }
+        toolbar.add(btnVersionConverter)
+
         panel.add(toolbar, BorderLayout.NORTH)
 
         val loadingHtml = """
